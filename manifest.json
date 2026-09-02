@@ -1,0 +1,16 @@
+{
+  "name": "Geodesic Navigation",
+  "short_name": "Geodesic",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#fbfaf7",
+  "theme_color": "#087f78",
+  "description": "A travel and navigation app for route planning, live tracking, and traffic insights.",
+  "icons": [
+    {
+      "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='192' height='192' viewBox='0 0 192 192'%3E%3Crect width='192' height='192' rx='40' fill='%23087f78'/%3E%3Cpath d='M48 116 L75 72 L95 94 L143 52 L144 124 L48 116 Z' fill='white'/%3E%3C/svg%3E",
+      "sizes": "192x192",
+      "type": "image/svg+xml"
+    }
+  ]
+}
