@@ -6,9 +6,9 @@ import 'leaflet-routing-machine';
 
 const getTrafficCondition = () => {
   const rand = Math.random();
-  if (rand < 0.6) return { level: 'clear', label: 'Clear', time: 0 };
-  if (rand < 0.85) return { level: 'moderate', label: 'Moderate', time: 1.2 };
-  return { level: 'heavy', label: 'Heavy', time: 1.5 };
+  if (rand < 0.6) return { level: 'clear', label: 'Clear roads', time: 0 };
+  if (rand < 0.85) return { level: 'moderate', label: 'Some traffic', time: 1.2 };
+  return { level: 'heavy', label: 'Heavy traffic', time: 1.5 };
 };
 
 const formatMinutes = (minutes) => {
@@ -16,33 +16,41 @@ const formatMinutes = (minutes) => {
   return value >= 60 ? `${Math.floor(value / 60)}h ${value % 60}m` : `${value} min`;
 };
 
+const OSM_TILES = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
+const SAT_TILES = 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
+
 function App() {
   const mapRef = useRef(null);
+  const baseLayerRef = useRef(null);
   const routeControlRef = useRef(null);
   const userMarkerRef = useRef(null);
   const watchIdRef = useRef(null);
   const lastPositionRef = useRef(null);
 
+  // ---- persistent preferences ----
   const [theme, setTheme] = useState(() => localStorage.getItem('geodesic-theme') || 'light');
-  const [screen, setScreen] = useState('search');
+  const [tileMode, setTileMode] = useState('map'); // 'map' | 'satellite'
+
+  // ---- app mode: the big split from the brief ----
+  const [appMode, setAppMode] = useState('explore'); // 'explore' | 'drive'
+  const [sheetExpanded, setSheetExpanded] = useState(true);
+
+  // ---- trip planning state ----
   const [start, setStart] = useState('');
   const [end, setEnd] = useState('');
-  const [status, setStatus] = useState('Find your next destination');
+  const [status, setStatus] = useState('Search a destination to begin');
   const [currentCoords, setCurrentCoords] = useState(null);
+  const [destCoords, setDestCoords] = useState(null);
   const [allRoutes, setAllRoutes] = useState([]);
   const [selectedRouteIndex, setSelectedRouteIndex] = useState(0);
   const [routeSummary, setRouteSummary] = useState({ eta: '--', distance: '--' });
-  const [routeDetails, setRouteDetails] = useState({
-    distance: '-- km',
-    time: '--',
-    traffic: 'Normal',
-    stops: '2',
-  });
-  const [trafficNote, setTrafficNote] = useState('');
-  const [liveSpeed, setLiveSpeed] = useState('0 km/h');
-  const [liveEta, setLiveEta] = useState('--');
-  const [traveling, setTraveling] = useState(false);
+  const [trafficNote, setTrafficNote] = useState(null);
   const [loading, setLoading] = useState(false);
+
+  // ---- live drive state ----
+  const [liveSpeed, setLiveSpeed] = useState(0);
+
+  const hasRoute = allRoutes.length > 0;
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -50,66 +58,84 @@ function App() {
   }, [theme]);
 
   useEffect(() => {
+    document.documentElement.dataset.appmode = appMode;
+  }, [appMode]);
+
+  // ---- map bootstrap ----
+  useEffect(() => {
     const map = L.map('map', { zoomControl: false }).setView([28.7041, 77.1025], 13);
     mapRef.current = map;
 
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    baseLayerRef.current = L.tileLayer(OSM_TILES, {
       maxZoom: 19,
       attribution: '&copy; OpenStreetMap contributors',
     }).addTo(map);
 
     L.control.zoom({ position: 'bottomright' }).addTo(map);
 
-    return () => {
-      map.remove();
-    };
+    return () => map.remove();
   }, []);
 
-  const setRouteData = (route) => {
+  // ---- swap between street map and satellite ----
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !baseLayerRef.current) return;
+    map.removeLayer(baseLayerRef.current);
+    baseLayerRef.current = tileMode === 'satellite'
+      ? L.tileLayer(SAT_TILES, { maxZoom: 19, attribution: 'Tiles &copy; Esri' })
+      : L.tileLayer(OSM_TILES, { maxZoom: 19, attribution: '&copy; OpenStreetMap contributors' });
+    baseLayerRef.current.addTo(map);
+  }, [tileMode]);
+
+  const placeUserMarker = (coords) => {
+    if (userMarkerRef.current) {
+      userMarkerRef.current.setLatLng(coords);
+    } else {
+      userMarkerRef.current = L.circleMarker(coords, {
+        radius: 9,
+        color: '#0f6b5c',
+        fillColor: '#1c8a76',
+        fillOpacity: 1,
+        weight: 3,
+        className: 'user-marker-pulse',
+      }).addTo(mapRef.current);
+    }
+  };
+
+  const applyRoute = (route) => {
     const distanceKm = (route.summary.totalDistance / 1000).toFixed(1);
     const etaText = formatMinutes(route.summary.totalTime / 60);
     const traffic = getTrafficCondition();
     setRouteSummary({ eta: etaText, distance: `${distanceKm} km` });
-    setRouteDetails({
-      distance: `${distanceKm} km`,
-      time: etaText,
-      traffic: traffic.label,
-      stops: String(route.waypoints?.length ?? 2),
-    });
-    setTrafficNote(`${traffic.level === 'clear' ? '✅' : traffic.level === 'moderate' ? '⚠️' : '🚨'} Traffic: ${traffic.label}`);
+    setTrafficNote(traffic);
   };
 
   const geocode = async (place) => {
     const response = await fetch(
       `https://nominatim.openstreetmap.org/search?format=json&limit=1&accept-language=en&q=${encodeURIComponent(place)}`
     );
-
-    if (!response.ok) throw new Error('Search unavailable. Try another location.');
-
+    if (!response.ok) throw new Error('Search is unavailable right now. Try again.');
     const results = await response.json();
-    if (!results.length) throw new Error(`"${place}" not found. Try a nearby city.`);
-
+    if (!results.length) throw new Error(`Couldn't find "${place}". Try a nearby landmark.`);
     return L.latLng(Number(results[0].lat), Number(results[0].lon));
   };
 
-  const calculateRoute = async () => {
+  const searchRoute = async () => {
     const startPlace = start.trim();
     const endPlace = end.trim();
-
     if (!startPlace || !endPlace) {
-      setStatus('Enter both a start and destination.');
+      setStatus('Enter both a starting point and a destination.');
       return;
     }
 
     setLoading(true);
-    setStatus('Finding your route...');
+    setStatus('Finding the best route...');
     try {
       const startCoords = currentCoords || (await geocode(startPlace));
       const endCoords = await geocode(endPlace);
+      setDestCoords(endCoords);
 
-      if (routeControlRef.current) {
-        mapRef.current.removeControl(routeControlRef.current);
-      }
+      if (routeControlRef.current) mapRef.current.removeControl(routeControlRef.current);
 
       const control = L.Routing.control({
         waypoints: [startCoords, endCoords],
@@ -118,12 +144,8 @@ function App() {
         show: false,
         fitSelectedRoutes: true,
         createMarker: () => null,
-        lineOptions: {
-          styles: [{ color: '#0f766e', opacity: 0.95, weight: 7 }],
-        },
-        altLineOptions: {
-          styles: [{ color: '#cbd5e1', opacity: 0.4, weight: 4, dashArray: '6, 4' }],
-        },
+        lineOptions: { styles: [{ color: '#0f6b5c', opacity: 0.95, weight: 6 }] },
+        altLineOptions: { styles: [{ color: '#b9c2bd', opacity: 0.7, weight: 4, dashArray: '2, 10' }] },
       }).addTo(mapRef.current);
 
       routeControlRef.current = control;
@@ -132,20 +154,14 @@ function App() {
         const routes = event.routes;
         setAllRoutes(routes);
         setSelectedRouteIndex(0);
-        setRouteData(routes[0]);
-
-        const bounds = L.latLngBounds(
-          routes[0].coordinates.map(c => [c.lat, c.lng])
-        );
-        mapRef.current.fitBounds(bounds, { padding: [100, 100], duration: 800 });
-
-        setScreen('route');
-        setStatus('Route found! Ready to navigate.');
+        applyRoute(routes[0]);
+        setSheetExpanded(true);
+        setStatus('Route ready.');
         setLoading(false);
       });
 
       control.on('routingerror', () => {
-        setStatus('No route found. Try different locations.');
+        setStatus("Couldn't connect these two points. Try different places.");
         setLoading(false);
       });
     } catch (error) {
@@ -154,287 +170,277 @@ function App() {
     }
   };
 
-  const handleSelectRoute = (index) => {
+  const selectRoute = (index) => {
     setSelectedRouteIndex(index);
-    const route = allRoutes[index];
-    if (route) {
-      setRouteData(route);
-    }
+    if (allRoutes[index]) applyRoute(allRoutes[index]);
   };
 
-  const handleMyLocation = () => {
+  const useMyLocation = () => {
     if (!navigator.geolocation) {
-      setStatus('Location not available in this browser.');
+      setStatus('This browser cannot access your location.');
       return;
     }
-
-    setStatus('Getting your location...');
-
+    setStatus('Locating you...');
     navigator.geolocation.getCurrentPosition(
       (position) => {
         const coords = L.latLng(position.coords.latitude, position.coords.longitude);
         setCurrentCoords(coords);
         setStart('My location');
-
-        if (userMarkerRef.current) {
-          userMarkerRef.current.setLatLng(coords);
-        } else {
-          userMarkerRef.current = L.circleMarker(coords, {
-            radius: 10,
-            color: '#0f766e',
-            fillColor: '#14b8a6',
-            fillOpacity: 1,
-            weight: 3,
-            className: 'user-marker-pulse',
-          }).addTo(mapRef.current);
-        }
-
-        mapRef.current.panTo(coords, { animate: true, duration: 0.7 });
-        setStatus('Location set as start point.');
+        placeUserMarker(coords);
+        mapRef.current.panTo(coords, { animate: true, duration: 0.6 });
+        setStatus('Location set as your start point.');
       },
-      () => {
-        setStatus('Unable to access your location. Check permissions.');
-      }
+      () => setStatus('Could not access your location. Check permissions.')
     );
   };
 
-  const handleTravelToggle = () => {
-    if (traveling) {
-      if (watchIdRef.current) {
-        navigator.geolocation.clearWatch(watchIdRef.current);
-        watchIdRef.current = null;
-      }
-      setTraveling(false);
-      setScreen('route');
-      setStatus('Navigation paused.');
-      return;
-    }
-
+  const startDrive = () => {
+    if (!hasRoute) return;
     if (!navigator.geolocation) {
-      setStatus('Live navigation unavailable.');
+      setStatus('Live drive needs location access, which this browser blocks.');
       return;
     }
-
-    setTraveling(true);
-    setScreen('live');
-    setStatus('Live navigation active. Follow the route.');
+    setAppMode('drive');
+    setSheetExpanded(false);
 
     watchIdRef.current = navigator.geolocation.watchPosition(
       (position) => {
         const coords = L.latLng(position.coords.latitude, position.coords.longitude);
-
-        if (lastPositionRef.current) {
-          const distance = coords.distanceTo(lastPositionRef.current);
-          if (distance < 5) return;
-        }
-
+        if (lastPositionRef.current && coords.distanceTo(lastPositionRef.current) < 4) return;
         lastPositionRef.current = coords;
         setCurrentCoords(coords);
-
-        if (userMarkerRef.current) {
-          userMarkerRef.current.setLatLng(coords);
-        } else {
-          userMarkerRef.current = L.circleMarker(coords, {
-            radius: 10,
-            color: '#0f766e',
-            fillColor: '#14b8a6',
-            fillOpacity: 1,
-            weight: 3,
-            className: 'user-marker-pulse',
-          }).addTo(mapRef.current);
-        }
-
+        placeUserMarker(coords);
         mapRef.current.panTo(coords, { animate: true, duration: 0.5 });
-        const speed = position.coords.speed === null ? 0 : Math.round(position.coords.speed * 3.6);
-        setLiveSpeed(`${speed} km/h`);
-        setLiveEta(routeSummary.eta || '--');
+        const speed = position.coords.speed == null ? 0 : Math.round(position.coords.speed * 3.6);
+        setLiveSpeed(speed);
       },
-      () => {
-        setStatus('Location update failed.');
-      },
+      () => setStatus('Lost your GPS signal.'),
       { enableHighAccuracy: true, maximumAge: 3000 }
     );
   };
 
+  const endDrive = () => {
+    if (watchIdRef.current) {
+      navigator.geolocation.clearWatch(watchIdRef.current);
+      watchIdRef.current = null;
+    }
+    setAppMode('explore');
+    setSheetExpanded(true);
+    setStatus('Drive ended.');
+  };
+
+  const recenter = () => {
+    if (currentCoords) mapRef.current.panTo(currentCoords, { animate: true, duration: 0.5 });
+  };
+
   return (
     <>
-      <main className="panel">
-        <div className="app-topbar">
-          <div className="brand">
-            <span className="brand-mark">🧭</span>
-            <span className="brand-name">Geodesic</span>
-          </div>
-          <button
-            className="theme-toggle"
-            type="button"
-            onClick={() => setTheme((prev) => (prev === 'light' ? 'dark' : 'light'))}
-            aria-label="Toggle dark mode"
-          >
-            {theme === 'light' ? '🌙' : '☀️'}
-          </button>
-        </div>
-
-        <div className="app-pills">
-          <button className={`app-pill ${screen === 'search' ? 'active' : ''}`} type="button" onClick={() => setScreen('search')}>
-            Search
-          </button>
-          <button className={`app-pill ${screen === 'route' ? 'active' : ''}`} type="button" onClick={() => setScreen('route')}>
-            Routes
-          </button>
-          <button className={`app-pill ${screen === 'live' ? 'active' : ''}`} type="button" onClick={() => setScreen('live')}>
-            Live
-          </button>
-        </div>
-
-        <section className={`screen ${screen === 'search' ? 'active' : ''}`} id="searchScreen">
-          <div className="search-sheet">
-            <div className="route-fields">
-              <div className="field">
-                <span className="pin" />
-                <input id="start" value={start} onChange={(e) => { setStart(e.target.value); if (e.target.value !== 'My location') setCurrentCoords(null); }} placeholder="Your location" />
-              </div>
-              <div className="field">
-                <span className="pin end" />
-                <input id="end" value={end} onChange={(e) => setEnd(e.target.value)} placeholder="Where to?" />
-              </div>
-              <button className="swap" type="button" onClick={() => [setStart(end), setEnd(start)]} aria-label="Swap">↕</button>
-            </div>
-            <div className="actions">
-              <button className={`primary ${loading ? 'loading' : ''}`} type="button" onClick={calculateRoute} disabled={loading}>
-                {loading ? '...' : 'Search'} <span>→</span>
-              </button>
-              <button className="secondary locate" type="button" onClick={handleMyLocation}>
-                <span>◎</span>
-              </button>
-            </div>
-          </div>
-          <div className="status">{status}</div>
-          {trafficNote && <div className={`traffic-conditions visible ${getTrafficCondition().level}`}>{trafficNote}</div>}
-        </section>
-
-        <section className={`screen ${screen === 'route' ? 'active' : ''}`} id="routeScreen">
-          <div className="section-header">
-            <span className="eyebrow">Route Ready</span>
-            <button className="text-button" type="button" onClick={() => setScreen('search')}>Edit</button>
-          </div>
-
-          <div className="summary-card">
-            <div className="summary-grid">
-              <div>
-                <span className="meta">ETA</span>
-                <strong>{routeSummary.eta}</strong>
-              </div>
-              <div>
-                <span className="meta">Distance</span>
-                <strong>{routeSummary.distance}</strong>
-              </div>
-            </div>
-          </div>
-
-          <div className="mini-tile-grid">
-            <div className="mini-tile">
-              <h4>Fuel</h4>
-              <strong>10%</strong>
-            </div>
-            <div className="mini-tile">
-              <h4>Alerts</h4>
-              <strong>2</strong>
-            </div>
-          </div>
-
-          <div className="route-details">
-            <div className="detail-item"><span className="detail-label">Distance</span><span>{routeDetails.distance}</span></div>
-            <div className="detail-item"><span className="detail-label">Time</span><span>{routeDetails.time}</span></div>
-            <div className="detail-item"><span className="detail-label">Traffic</span><span>{routeDetails.traffic}</span></div>
-            <div className="detail-item"><span className="detail-label">Stops</span><span>{routeDetails.stops}</span></div>
-          </div>
-
-          <div className={`alternative-routes ${allRoutes.length ? 'visible' : ''}`}>
-            <div className="routes-label">Alternatives</div>
-            <div>
-              {allRoutes.map((route, index) => {
-                const distance = (route.summary.totalDistance / 1000).toFixed(1);
-                const traffic = getTrafficCondition();
-                const adjustedTime = Math.round((route.summary.totalTime / 60) * (traffic.time || 1));
-                const timeText = formatMinutes(adjustedTime);
-
-                return (
-                  <div
-                    key={index}
-                    className={`route-option ${selectedRouteIndex === index ? 'selected' : ''}`}
-                    onClick={() => handleSelectRoute(index)}
-                  >
-                    <div className="route-info">
-                      <strong>Route {index + 1}</strong>
-                      <span className={`traffic-badge traffic-${traffic.level}`}>{traffic.label}</span>
-                    </div>
-                    <div className="route-traffic">
-                      <span>⏱️ {timeText}</span>
-                      <span>📍 {distance} km</span>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-
-          <button className={`travel ${traveling ? 'active' : ''}`} type="button" onClick={handleTravelToggle}>
-            {traveling ? 'Stop' : 'Navigate'} <span>→</span>
-          </button>
-          <div className={`live-status ${traveling ? 'visible' : ''}`}>
-            <span className="live-dot" />
-            <span>Live</span>
-            <span>{traveling ? `${liveSpeed}` : 'Ready'}</span>
-          </div>
-        </section>
-
-        <section className={`screen ${screen === 'live' ? 'active' : ''}`} id="liveScreen">
-          <div className="section-header">
-            <span className="eyebrow">Navigation</span>
-            <button className="text-button" type="button" onClick={() => {
-              if (watchIdRef.current) {
-                navigator.geolocation.clearWatch(watchIdRef.current);
-                watchIdRef.current = null;
-              }
-              setTraveling(false);
-              setScreen('route');
-            }}>End</button>
-          </div>
-
-          <div className="trip-card">
-            <div className="detail-item"><span className="detail-label">Speed</span><span>{liveSpeed}</span></div>
-            <div className="detail-item"><span className="detail-label">Route</span><span>In Progress</span></div>
-            <div className="detail-item"><span className="detail-label">ETA</span><span>{liveEta}</span></div>
-          </div>
-
-          <div className="mini-tile-grid">
-            <div className="mini-tile"><h4>Turn</h4><strong>Ahead</strong></div>
-            <div className="mini-tile"><h4>Signal</h4><strong>On</strong></div>
-          </div>
-
-          <div className="map-chip">
-            <span><strong>Map</strong></span>
-            <span>Auto-tracking</span>
-          </div>
-
-          <div className="live-status visible">
-            <span className="live-dot" />
-            <span>Tracking</span>
-            <span>{liveSpeed}</span>
-          </div>
-          <button className="secondary" type="button" onClick={() => { if (currentCoords) mapRef.current.panTo(currentCoords, { animate: true, duration: 0.6 }); }} style={{ width: '100%', marginTop: '18px' }}>
-            Center Map
-          </button>
-        </section>
-
-        <nav className="bottom-nav" aria-label="Navigation">
-          <button className={`nav-item ${screen === 'search' ? 'active' : ''}`} type="button" onClick={() => setScreen('search')}>Search</button>
-          <button className={`nav-item ${screen === 'route' ? 'active' : ''}`} type="button" onClick={() => setScreen('route')}>Routes</button>
-          <button className={`nav-item ${screen === 'live' ? 'active' : ''}`} type="button" onClick={() => setScreen('live')}>Drive</button>
-          <button className="nav-item" type="button">More</button>
-        </nav>
-      </main>
       <div id="map" />
+
+      {/* floating overlay controls above the map */}
+      <div className="map-overlay">
+        <button
+          className="round-btn"
+          type="button"
+          onClick={() => setTheme((t) => (t === 'light' ? 'dark' : 'light'))}
+          aria-label="Toggle dark mode"
+        >
+          {theme === 'light' ? '🌙' : '☀️'}
+        </button>
+
+        <div className="mode-switch" role="tablist" aria-label="App mode">
+          <button
+            role="tab"
+            aria-selected={appMode === 'explore'}
+            className={appMode === 'explore' ? 'active' : ''}
+            type="button"
+            onClick={endDrive}
+          >
+            Explore
+          </button>
+          <button
+            role="tab"
+            aria-selected={appMode === 'drive'}
+            className={`${appMode === 'drive' ? 'active' : ''} ${!hasRoute ? 'locked' : ''}`}
+            type="button"
+            disabled={!hasRoute}
+            onClick={startDrive}
+          >
+            Drive
+          </button>
+        </div>
+
+        <button
+          className="round-btn"
+          type="button"
+          onClick={() => setTileMode((m) => (m === 'map' ? 'satellite' : 'map'))}
+          aria-label="Toggle satellite view"
+        >
+          {tileMode === 'map' ? '🛰️' : '🗺️'}
+        </button>
+      </div>
+
+      {appMode === 'explore' && (
+        <button className="locate-fab" type="button" onClick={useMyLocation} aria-label="Use my location">
+          ◎
+        </button>
+      )}
+
+      {appMode === 'drive' && (
+        <>
+          <div className="drive-hud-top">
+            <span className="drive-hud-eyebrow">Heading to</span>
+            <strong className="drive-hud-destination">{end || 'destination'}</strong>
+          </div>
+          <button className="locate-fab drive" type="button" onClick={recenter} aria-label="Recenter map">
+            ◎
+          </button>
+        </>
+      )}
+
+      {/* ================= EXPLORE SHEET ================= */}
+      {appMode === 'explore' && (
+        <section className={`sheet ${sheetExpanded ? 'expanded' : 'peek'}`}>
+          <button
+            className="sheet-handle"
+            type="button"
+            onClick={() => setSheetExpanded((v) => !v)}
+            aria-label={sheetExpanded ? 'Collapse panel' : 'Expand panel'}
+          >
+            <span className="handle-bar" />
+          </button>
+
+          <div className="sheet-body">
+            <div className="sheet-brand">
+              <span className="sheet-brand-mark">🧭</span>
+              <span className="sheet-brand-name">Geodesic</span>
+            </div>
+
+            {!hasRoute && (
+              <div className="search-block">
+                <div className="field-stack">
+                  <div className="field-row">
+                    <span className="dot start" />
+                    <input
+                      value={start}
+                      onFocus={() => setSheetExpanded(true)}
+                      onChange={(e) => {
+                        setStart(e.target.value);
+                        if (e.target.value !== 'My location') setCurrentCoords(null);
+                      }}
+                      placeholder="Starting point"
+                    />
+                  </div>
+                  <div className="field-row">
+                    <span className="dot end" />
+                    <input
+                      value={end}
+                      onFocus={() => setSheetExpanded(true)}
+                      onChange={(e) => setEnd(e.target.value)}
+                      placeholder="Where are you going?"
+                    />
+                  </div>
+                  <button
+                    className="swap-btn"
+                    type="button"
+                    onClick={() => { setStart(end); setEnd(start); }}
+                    aria-label="Swap start and destination"
+                  >
+                    ⇅
+                  </button>
+                </div>
+
+                <div className="action-row">
+                  <button className={`primary-btn ${loading ? 'busy' : ''}`} type="button" onClick={searchRoute} disabled={loading}>
+                    {loading ? 'Searching…' : 'Find route'}
+                  </button>
+                  <button className="ghost-btn" type="button" onClick={useMyLocation}>
+                    My location
+                  </button>
+                </div>
+
+                <p className="status-line">{status}</p>
+              </div>
+            )}
+
+            {hasRoute && (
+              <div className="route-block">
+                <div className="route-headline">
+                  <div>
+                    <span className="eyebrow">To</span>
+                    <strong>{end}</strong>
+                  </div>
+                  <button className="ghost-btn small" type="button" onClick={() => { setAllRoutes([]); setStatus('Search a destination to begin'); }}>
+                    Edit
+                  </button>
+                </div>
+
+                <div className="stat-strip">
+                  <div>
+                    <span className="stat-value">{routeSummary.eta}</span>
+                    <span className="stat-label">Arrival time</span>
+                  </div>
+                  <div>
+                    <span className="stat-value">{routeSummary.distance}</span>
+                    <span className="stat-label">Distance</span>
+                  </div>
+                </div>
+
+                {trafficNote && (
+                  <div className={`traffic-pill ${trafficNote.level}`}>
+                    {trafficNote.level === 'clear' ? '●' : trafficNote.level === 'moderate' ? '▲' : '■'} {trafficNote.label}
+                  </div>
+                )}
+
+                {allRoutes.length > 1 && (
+                  <div className="route-alt-list">
+                    {allRoutes.map((route, index) => {
+                      const distance = (route.summary.totalDistance / 1000).toFixed(1);
+                      const time = formatMinutes(route.summary.totalTime / 60);
+                      return (
+                        <button
+                          key={index}
+                          type="button"
+                          className={`route-alt ${selectedRouteIndex === index ? 'selected' : ''}`}
+                          onClick={() => selectRoute(index)}
+                        >
+                          <span>Route {index + 1}</span>
+                          <span className="route-alt-meta">{time} · {distance} km</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+
+                <button className="primary-btn drive-cta" type="button" onClick={startDrive}>
+                  Start drive
+                </button>
+              </div>
+            )}
+          </div>
+        </section>
+      )}
+
+      {/* ================= DRIVE HUD BOTTOM ================= */}
+      {appMode === 'drive' && (
+        <section className="drive-hud-bottom">
+          <div className="drive-stat">
+            <span className="drive-stat-value">{liveSpeed}</span>
+            <span className="drive-stat-label">km/h</span>
+          </div>
+          <div className="drive-stat divider">
+            <span className="drive-stat-value">{routeSummary.eta}</span>
+            <span className="drive-stat-label">eta</span>
+          </div>
+          <div className="drive-stat">
+            <span className="drive-stat-value">{routeSummary.distance}</span>
+            <span className="drive-stat-label">route</span>
+          </div>
+          <button className="end-drive-btn" type="button" onClick={endDrive}>
+            End
+          </button>
+        </section>
+      )}
     </>
   );
 }
