@@ -93,8 +93,8 @@ function App() {
     } else {
       userMarkerRef.current = L.circleMarker(coords, {
         radius: 9,
-        color: '#0f6b5c',
-        fillColor: '#1c8a76',
+        color: '#4f7259',
+        fillColor: '#62876c',
         fillOpacity: 1,
         weight: 3,
         className: 'user-marker-pulse',
@@ -144,8 +144,8 @@ function App() {
         show: false,
         fitSelectedRoutes: true,
         createMarker: () => null,
-        lineOptions: { styles: [{ color: '#0f6b5c', opacity: 0.95, weight: 6 }] },
-        altLineOptions: { styles: [{ color: '#b9c2bd', opacity: 0.7, weight: 4, dashArray: '2, 10' }] },
+        lineOptions: { styles: [{ color: '#62876c', opacity: 0.95, weight: 6 }] },
+        altLineOptions: { styles: [{ color: '#c3b8a2', opacity: 0.7, weight: 4, dashArray: '2, 10' }] },
       }).addTo(mapRef.current);
 
       routeControlRef.current = control;
