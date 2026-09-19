@@ -17,6 +17,8 @@
   --teal-dim: #e6ede2;
   --amber: #c67a4e;        /* warm terracotta */
   --amber-dim: #f4e2d3;
+  --hud: #4a4136;          /* warm deep taupe for HUD — softer than pure ink */
+  --hud-ink: #f6efe1;      /* warm off-cream text on the HUD */
   --radius-lg: 24px;
   --radius-md: 16px;
   /* soft, low-contrast shadows so nothing feels sharp */
@@ -37,6 +39,8 @@
   --teal-dim: #2a322a;
   --amber: #dd9468;
   --amber-dim: #35291f;
+  --hud: #17150f;          /* deep warm charcoal HUD in dark mode */
+  --hud-ink: #ece3d4;
   --shadow: 0 14px 34px rgba(0, 0, 0, 0.42);
   --shadow-soft: 0 6px 18px rgba(0, 0, 0, 0.32);
 }
@@ -375,8 +379,8 @@ input::placeholder { color: var(--muted); font-weight: 500; }
   left: 14px;
   right: 14px;
   z-index: 1150;
-  background: var(--ink);
-  color: var(--paper);
+  background: var(--hud);
+  color: var(--hud-ink);
   border-radius: var(--radius-md);
   padding: 14px 18px;
   box-shadow: var(--shadow);
@@ -392,17 +396,17 @@ input::placeholder { color: var(--muted); font-weight: 500; }
   z-index: 1150;
   display: flex;
   align-items: center;
-  background: var(--ink);
-  color: var(--paper);
+  background: var(--hud);
+  color: var(--hud-ink);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow);
   padding: 14px 10px;
   gap: 4px;
 }
 .drive-stat { flex: 1; text-align: center; }
-.drive-stat.divider { border-left: 1px solid rgba(236, 227, 212, 0.16); border-right: 1px solid rgba(236, 227, 212, 0.16); }
+.drive-stat.divider { border-left: 1px solid rgba(246, 239, 225, 0.14); border-right: 1px solid rgba(246, 239, 225, 0.14); }
 .drive-stat-value { display: block; font-family: 'Caveat', cursive; font-weight: 700; font-size: 30px; line-height: 1; color: var(--amber); }
-.drive-stat-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: rgba(243, 235, 221, 0.6); }
+.drive-stat-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: rgba(246, 239, 225, 0.62); }
 
 .end-drive-btn {
   flex: 0 0 auto;
