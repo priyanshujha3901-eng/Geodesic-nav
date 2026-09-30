@@ -7,6 +7,8 @@ import 'leaflet-routing-machine';
 // Zoom level used while actively driving — this is what makes roads
 // actually visible instead of the whole-route overview zoom.
 const NAV_ZOOM = 17;
+const LIVE_LOCATION_MIN_DISTANCE = 20;
+const LIVE_LOCATION_MAX_ACCURACY = 35;
 
 const getTrafficCondition = () => {
   const rand = Math.random();
@@ -79,6 +81,7 @@ function App() {
   const userMarkerRef = useRef(null);
   const watchIdRef = useRef(null);
   const selectedRouteRef = useRef(null);
+  const lastLiveLocationRef = useRef(null);
 
   const [theme, setTheme] = useState(() => localStorage.getItem('geodesic-theme') || 'light');
   const [screen, setScreen] = useState('search'); // search | preview | drive
@@ -116,6 +119,7 @@ function App() {
           const coords = L.latLng(position.coords.latitude, position.coords.longitude);
           setCurrentCoords(coords);
           setStart('Your location');
+          ensureUserMarker(coords);
           map.setView(coords, 15, { animate: true });
         },
         () => {},
@@ -129,6 +133,8 @@ function App() {
   }, []);
 
   const ensureUserMarker = (coords) => {
+    if (!coords || !mapRef.current) return;
+
     if (userMarkerRef.current) {
       userMarkerRef.current.setLatLng(coords);
     } else {
@@ -141,6 +147,35 @@ function App() {
         className: 'user-marker-pulse',
       }).addTo(mapRef.current);
     }
+  };
+
+  const syncLiveUserPosition = (coords, zoom = null) => {
+    if (!coords) return;
+
+    ensureUserMarker(coords);
+
+    if (!mapRef.current) return;
+
+    if (zoom != null) {
+      mapRef.current.setView(coords, zoom, { animate: true, duration: 0.5 });
+    } else {
+      mapRef.current.panTo(coords, { animate: true, duration: 0.5 });
+    }
+  };
+
+  const shouldUpdateLiveLocation = (coords, accuracyMeters = 25) => {
+    if (!coords) return false;
+    if (!lastLiveLocationRef.current) {
+      lastLiveLocationRef.current = coords;
+      return true;
+    }
+
+    const movedMeters = coords.distanceTo(lastLiveLocationRef.current);
+    if (accuracyMeters > LIVE_LOCATION_MAX_ACCURACY) return false;
+    if (movedMeters < LIVE_LOCATION_MIN_DISTANCE) return false;
+
+    lastLiveLocationRef.current = coords;
+    return true;
   };
 
   const applyRouteSelection = (route) => {
@@ -246,8 +281,8 @@ function App() {
         const coords = L.latLng(position.coords.latitude, position.coords.longitude);
         setCurrentCoords(coords);
         setStart('Your location');
-        ensureUserMarker(coords);
-        mapRef.current.setView(coords, 15, { animate: true });
+        lastLiveLocationRef.current = coords;
+        syncLiveUserPosition(coords, 15);
         setStatus('');
       },
       () => setStatus('Unable to access your location. Check permissions.')
@@ -259,10 +294,8 @@ function App() {
     if (!route) return;
 
     const initialPoint = currentCoords || route.coordinates[0];
-    ensureUserMarker(initialPoint);
-    // The fix: zoom straight to navigation level on the live dot, not
-    // whatever zoom the whole-route overview left the map at.
-    mapRef.current.setView(initialPoint, NAV_ZOOM, { animate: true });
+    lastLiveLocationRef.current = initialPoint;
+    syncLiveUserPosition(initialPoint, NAV_ZOOM);
 
     const progress = getRouteProgress(route, initialPoint);
     setCurrentInstruction(progress.instruction);
@@ -283,14 +316,19 @@ function App() {
     watchIdRef.current = navigator.geolocation.watchPosition(
       (position) => {
         const coords = L.latLng(position.coords.latitude, position.coords.longitude);
-        setCurrentCoords(coords);
-        ensureUserMarker(coords);
-        // Keep re-centering AND re-zooming on every fix so the view never
-        // drifts back out to the overview zoom.
-        mapRef.current.setView(coords, NAV_ZOOM, { animate: true, duration: 0.5 });
-
+        const accuracyMeters = position.coords.accuracy ?? 25;
         const speed = position.coords.speed == null ? 0 : Math.round(position.coords.speed * 3.6);
         setLiveSpeed(`${speed} km/h`);
+
+        if (accuracyMeters > LIVE_LOCATION_MAX_ACCURACY) {
+          return;
+        }
+
+        setCurrentCoords(coords);
+
+        if (shouldUpdateLiveLocation(coords, accuracyMeters)) {
+          syncLiveUserPosition(coords, NAV_ZOOM);
+        }
 
         const activeRoute = selectedRouteRef.current;
         if (activeRoute) {
@@ -314,6 +352,7 @@ function App() {
       navigator.geolocation.clearWatch(watchIdRef.current);
       watchIdRef.current = null;
     }
+    lastLiveLocationRef.current = null;
     setScreen('preview');
   };
 
