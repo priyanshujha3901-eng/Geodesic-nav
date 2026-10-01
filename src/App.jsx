@@ -4,11 +4,34 @@ import 'leaflet/dist/leaflet.css';
 import 'leaflet-routing-machine/dist/leaflet-routing-machine.css';
 import 'leaflet-routing-machine';
 
-// Zoom level used while actively driving — this is what makes roads
-// actually visible instead of the whole-route overview zoom.
 const NAV_ZOOM = 17;
-const LIVE_LOCATION_MIN_DISTANCE = 20;
-const LIVE_LOCATION_MAX_ACCURACY = 35;
+const HEADING_SCALE = 1.8;
+
+// routing.openstreetmap.de is the OSRM project's free community demo server —
+// it's the only free, no-API-key option that actually serves car/bike/foot
+// profiles (the main public demo at router.project-osrm.org only does cars).
+// It's rate-limited (~1 req/sec, non-commercial use) so don't hammer it.
+const TRANSPORT_PROFILES = {
+  car: { label: 'Car', icon: '🚗', serviceUrl: 'https://routing.openstreetmap.de/routed-car/route/v1', profile: 'driving' },
+  bike: { label: 'Bike', icon: '🚴', serviceUrl: 'https://routing.openstreetmap.de/routed-bike/route/v1', profile: 'bike' },
+  walk: { label: 'Walk', icon: '🚶', serviceUrl: 'https://routing.openstreetmap.de/routed-foot/route/v1', profile: 'foot' },
+  // No free public transit-routing API exists, so "Bus" reuses the car
+  // route's geometry and slows down the time estimate — clearly labelled
+  // as estimated in the UI rather than pretending it's real transit data.
+  bus: { label: 'Bus', icon: '🚌', simulated: true },
+};
+const TRANSPORT_ORDER = ['car', 'bike', 'walk', 'bus'];
+
+const MAP_LAYERS = {
+  street: {
+    url: 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+    attribution: '&copy; OpenStreetMap contributors',
+  },
+  satellite: {
+    url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+    attribution: 'Tiles &copy; Esri — Source: Esri, Maxar, Earthstar Geographics',
+  },
+};
 
 const getTrafficCondition = () => {
   const rand = Math.random();
@@ -46,8 +69,18 @@ const turnIcon = (instruction) => {
   }
 };
 
-// Finds the point on the route nearest to the user, the next maneuver ahead
-// of that point, and how much distance is left to the destination.
+// Compass bearing (0-360, 0 = north) from one LatLng to another.
+const computeBearing = (from, to) => {
+  const lat1 = (from.lat * Math.PI) / 180;
+  const lat2 = (to.lat * Math.PI) / 180;
+  const dLon = ((to.lng - from.lng) * Math.PI) / 180;
+  const y = Math.sin(dLon) * Math.cos(lat2);
+  const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLon);
+  return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
+};
+
+// Finds the nearest point on the route to the user, the next maneuver ahead
+// of it, and the remaining distance to the destination.
 const getRouteProgress = (route, userLatLng) => {
   const coords = route.coordinates;
   let nearestIdx = 0;
@@ -81,17 +114,25 @@ function App() {
   const userMarkerRef = useRef(null);
   const watchIdRef = useRef(null);
   const selectedRouteRef = useRef(null);
-  const lastLiveLocationRef = useRef(null);
+  const streetLayerRef = useRef(null);
+  const satelliteLayerRef = useRef(null);
+  const lastStartCoordsRef = useRef(null);
+  const lastEndCoordsRef = useRef(null);
+  const lastHeadingCoordsRef = useRef(null);
+  const headingRef = useRef(0);
 
   const [theme, setTheme] = useState(() => localStorage.getItem('geodesic-theme') || 'light');
   const [screen, setScreen] = useState('search'); // search | preview | drive
+  const [mapType, setMapType] = useState('street'); // street | satellite
+  const [povMode, setPovMode] = useState('north'); // north | heading
+  const [transportMode, setTransportMode] = useState('car');
   const [start, setStart] = useState('');
   const [end, setEnd] = useState('');
   const [status, setStatus] = useState('');
   const [currentCoords, setCurrentCoords] = useState(null);
   const [allRoutes, setAllRoutes] = useState([]);
   const [selectedRouteIndex, setSelectedRouteIndex] = useState(0);
-  const [routeSummary, setRouteSummary] = useState({ eta: '--', distance: '--', arrival: '--' });
+  const [routeSummary, setRouteSummary] = useState({ eta: '--', distance: '--', arrival: '--', simulated: false });
   const [trafficNote, setTrafficNote] = useState(null);
   const [liveSpeed, setLiveSpeed] = useState('0 km/h');
   const [driveStats, setDriveStats] = useState({ eta: '--', distance: '--', arrival: '--' });
@@ -107,19 +148,16 @@ function App() {
     const map = L.map('map', { zoomControl: false }).setView([28.7041, 77.1025], 13);
     mapRef.current = map;
 
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      maxZoom: 19,
-      attribution: '&copy; OpenStreetMap contributors',
-    }).addTo(map);
+    streetLayerRef.current = L.tileLayer(MAP_LAYERS.street.url, { maxZoom: 19, attribution: MAP_LAYERS.street.attribution });
+    satelliteLayerRef.current = L.tileLayer(MAP_LAYERS.satellite.url, { maxZoom: 19, attribution: MAP_LAYERS.satellite.attribution });
+    streetLayerRef.current.addTo(map);
 
-    // Try to center on the user right away, like Waze does on launch.
     if (navigator.geolocation) {
       navigator.geolocation.getCurrentPosition(
         (position) => {
           const coords = L.latLng(position.coords.latitude, position.coords.longitude);
           setCurrentCoords(coords);
           setStart('Your location');
-          ensureUserMarker(coords);
           map.setView(coords, 15, { animate: true });
         },
         () => {},
@@ -132,50 +170,63 @@ function App() {
     };
   }, []);
 
-  const ensureUserMarker = (coords) => {
-    if (!coords || !mapRef.current) return;
+  const toggleMapType = () => {
+    const map = mapRef.current;
+    setMapType((prev) => {
+      const next = prev === 'street' ? 'satellite' : 'street';
+      if (next === 'satellite') {
+        map.removeLayer(streetLayerRef.current);
+        map.addLayer(satelliteLayerRef.current);
+      } else {
+        map.removeLayer(satelliteLayerRef.current);
+        map.addLayer(streetLayerRef.current);
+      }
+      return next;
+    });
+  };
 
+  // Rotates the whole map DOM node to face the direction of travel. The
+  // user's own marker is counter-rotated separately (see setMarkerHeading)
+  // so it always points the right way regardless of this.
+  const applyMapRotation = () => {
+    const container = mapRef.current?.getContainer();
+    if (!container) return;
+    container.style.transformOrigin = '50% 50%';
+    container.style.transition = 'transform 0.3s linear';
+    if (povMode === 'heading') {
+      container.style.transform = `rotate(${-headingRef.current}deg) scale(${HEADING_SCALE})`;
+    } else {
+      container.style.transform = 'none';
+    }
+  };
+
+  useEffect(() => {
+    applyMapRotation();
+    if (!mapRef.current) return;
+    if (povMode === 'heading') mapRef.current.dragging.disable();
+    else mapRef.current.dragging.enable();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [povMode]);
+
+  const setMarkerHeading = (bearing) => {
+    const shape = userMarkerRef.current?.getElement()?.querySelector('.user-arrow-shape');
+    if (shape) shape.style.transform = `rotate(${bearing}deg)`;
+  };
+
+  const userIcon = () =>
+    L.divIcon({
+      className: 'user-marker-icon',
+      html: '<div class="user-arrow-shape">▲</div>',
+      iconSize: [30, 30],
+      iconAnchor: [15, 15],
+    });
+
+  const ensureUserMarker = (coords) => {
     if (userMarkerRef.current) {
       userMarkerRef.current.setLatLng(coords);
     } else {
-      userMarkerRef.current = L.circleMarker(coords, {
-        radius: 9,
-        color: '#1d4ed8',
-        fillColor: '#3b82f6',
-        fillOpacity: 1,
-        weight: 3,
-        className: 'user-marker-pulse',
-      }).addTo(mapRef.current);
+      userMarkerRef.current = L.marker(coords, { icon: userIcon(), interactive: false }).addTo(mapRef.current);
     }
-  };
-
-  const syncLiveUserPosition = (coords, zoom = null) => {
-    if (!coords) return;
-
-    ensureUserMarker(coords);
-
-    if (!mapRef.current) return;
-
-    if (zoom != null) {
-      mapRef.current.setView(coords, zoom, { animate: true, duration: 0.5 });
-    } else {
-      mapRef.current.panTo(coords, { animate: true, duration: 0.5 });
-    }
-  };
-
-  const shouldUpdateLiveLocation = (coords, accuracyMeters = 25) => {
-    if (!coords) return false;
-    if (!lastLiveLocationRef.current) {
-      lastLiveLocationRef.current = coords;
-      return true;
-    }
-
-    const movedMeters = coords.distanceTo(lastLiveLocationRef.current);
-    if (accuracyMeters > LIVE_LOCATION_MAX_ACCURACY) return false;
-    if (movedMeters < LIVE_LOCATION_MIN_DISTANCE) return false;
-
-    lastLiveLocationRef.current = coords;
-    return true;
   };
 
   const applyRouteSelection = (route) => {
@@ -183,7 +234,7 @@ function App() {
     const distanceKm = (route.summary.totalDistance / 1000).toFixed(1);
     const etaText = formatMinutes(route.summary.totalTime / 60);
     const arrivalText = formatClock(new Date(Date.now() + route.summary.totalTime * 1000));
-    setRouteSummary({ eta: etaText, distance: `${distanceKm} km`, arrival: arrivalText });
+    setRouteSummary({ eta: etaText, distance: `${distanceKm} km`, arrival: arrivalText, simulated: !!route.simulated });
     setTrafficNote(getTrafficCondition());
   };
 
@@ -195,6 +246,66 @@ function App() {
     const results = await response.json();
     if (!results.length) throw new Error(`"${place}" not found. Try a nearby city.`);
     return L.latLng(Number(results[0].lat), Number(results[0].lon));
+  };
+
+  const runRouting = (startCoords, endCoords, mode) => {
+    const profileInfo = TRANSPORT_PROFILES[mode];
+    const fetchProfile = profileInfo.simulated ? TRANSPORT_PROFILES.car : profileInfo;
+
+    if (routeControlRef.current) {
+      mapRef.current.removeControl(routeControlRef.current);
+    }
+
+    const control = L.Routing.control({
+      waypoints: [startCoords, endCoords],
+      serviceUrl: fetchProfile.serviceUrl,
+      profile: fetchProfile.profile,
+      addWaypoints: false,
+      routeWhileDragging: false,
+      show: false,
+      fitSelectedRoutes: true,
+      createMarker: () => null,
+      lineOptions: {
+        styles: [
+          { color: '#1d4ed8', opacity: 0.25, weight: 12 },
+          { color: '#3b82f6', opacity: 1, weight: 6 },
+        ],
+      },
+      altLineOptions: {
+        styles: [{ color: '#94a3b8', opacity: 0.7, weight: 5 }],
+      },
+    }).addTo(mapRef.current);
+
+    routeControlRef.current = control;
+
+    control.on('routesfound', (event) => {
+      let routes = event.routes;
+      if (profileInfo.simulated) {
+        routes = routes.map((r) => ({
+          ...r,
+          summary: {
+            totalDistance: r.summary.totalDistance,
+            totalTime: r.summary.totalTime * 1.6 + 300,
+          },
+          simulated: true,
+        }));
+      }
+      setAllRoutes(routes);
+      setSelectedRouteIndex(0);
+      applyRouteSelection(routes[0]);
+
+      const bounds = L.latLngBounds(routes[0].coordinates.map((c) => [c.lat, c.lng]));
+      mapRef.current.fitBounds(bounds, { padding: [80, 80], duration: 0.6 });
+
+      setScreen('preview');
+      setStatus('');
+      setLoading(false);
+    });
+
+    control.on('routingerror', () => {
+      setStatus(mode !== 'car' ? 'No route found for this mode. Try Car instead.' : 'No route found. Try different locations.');
+      setLoading(false);
+    });
   };
 
   const calculateRoute = async () => {
@@ -215,52 +326,21 @@ function App() {
     try {
       const startCoords = currentCoords || (await geocode(startPlace));
       const endCoords = await geocode(endPlace);
-
-      if (routeControlRef.current) {
-        mapRef.current.removeControl(routeControlRef.current);
-      }
-
-      const control = L.Routing.control({
-        waypoints: [startCoords, endCoords],
-        addWaypoints: false,
-        routeWhileDragging: false,
-        show: false,
-        fitSelectedRoutes: true,
-        createMarker: () => null,
-        lineOptions: {
-          styles: [
-            { color: '#1d4ed8', opacity: 0.25, weight: 12 },
-            { color: '#3b82f6', opacity: 1, weight: 6 },
-          ],
-        },
-        altLineOptions: {
-          styles: [{ color: '#94a3b8', opacity: 0.7, weight: 5 }],
-        },
-      }).addTo(mapRef.current);
-
-      routeControlRef.current = control;
-
-      control.on('routesfound', (event) => {
-        const routes = event.routes;
-        setAllRoutes(routes);
-        setSelectedRouteIndex(0);
-        applyRouteSelection(routes[0]);
-
-        const bounds = L.latLngBounds(routes[0].coordinates.map((c) => [c.lat, c.lng]));
-        mapRef.current.fitBounds(bounds, { padding: [80, 80], duration: 0.6 });
-
-        setScreen('preview');
-        setStatus('');
-        setLoading(false);
-      });
-
-      control.on('routingerror', () => {
-        setStatus('No route found. Try different locations.');
-        setLoading(false);
-      });
+      lastStartCoordsRef.current = startCoords;
+      lastEndCoordsRef.current = endCoords;
+      runRouting(startCoords, endCoords, transportMode);
     } catch (error) {
       setStatus(error.message);
       setLoading(false);
+    }
+  };
+
+  const handleModeChange = (mode) => {
+    setTransportMode(mode);
+    if (screen === 'preview' && lastStartCoordsRef.current && lastEndCoordsRef.current) {
+      setLoading(true);
+      setStatus('Updating route...');
+      runRouting(lastStartCoordsRef.current, lastEndCoordsRef.current, mode);
     }
   };
 
@@ -281,8 +361,8 @@ function App() {
         const coords = L.latLng(position.coords.latitude, position.coords.longitude);
         setCurrentCoords(coords);
         setStart('Your location');
-        lastLiveLocationRef.current = coords;
-        syncLiveUserPosition(coords, 15);
+        ensureUserMarker(coords);
+        mapRef.current.setView(coords, 15, { animate: true });
         setStatus('');
       },
       () => setStatus('Unable to access your location. Check permissions.')
@@ -294,8 +374,11 @@ function App() {
     if (!route) return;
 
     const initialPoint = currentCoords || route.coordinates[0];
-    lastLiveLocationRef.current = initialPoint;
-    syncLiveUserPosition(initialPoint, NAV_ZOOM);
+    ensureUserMarker(initialPoint);
+    lastHeadingCoordsRef.current = initialPoint;
+    headingRef.current = 0;
+    setPovMode('north');
+    mapRef.current.setView(initialPoint, NAV_ZOOM, { animate: true });
 
     const progress = getRouteProgress(route, initialPoint);
     setCurrentInstruction(progress.instruction);
@@ -316,19 +399,20 @@ function App() {
     watchIdRef.current = navigator.geolocation.watchPosition(
       (position) => {
         const coords = L.latLng(position.coords.latitude, position.coords.longitude);
-        const accuracyMeters = position.coords.accuracy ?? 25;
+        setCurrentCoords(coords);
+        ensureUserMarker(coords);
+        mapRef.current.setView(coords, NAV_ZOOM, { animate: true, duration: 0.5 });
+
+        if (lastHeadingCoordsRef.current && coords.distanceTo(lastHeadingCoordsRef.current) > 3) {
+          const bearing = computeBearing(lastHeadingCoordsRef.current, coords);
+          headingRef.current = bearing;
+          setMarkerHeading(bearing);
+          applyMapRotation();
+        }
+        lastHeadingCoordsRef.current = coords;
+
         const speed = position.coords.speed == null ? 0 : Math.round(position.coords.speed * 3.6);
         setLiveSpeed(`${speed} km/h`);
-
-        if (accuracyMeters > LIVE_LOCATION_MAX_ACCURACY) {
-          return;
-        }
-
-        setCurrentCoords(coords);
-
-        if (shouldUpdateLiveLocation(coords, accuracyMeters)) {
-          syncLiveUserPosition(coords, NAV_ZOOM);
-        }
 
         const activeRoute = selectedRouteRef.current;
         if (activeRoute) {
@@ -352,7 +436,10 @@ function App() {
       navigator.geolocation.clearWatch(watchIdRef.current);
       watchIdRef.current = null;
     }
-    lastLiveLocationRef.current = null;
+    setPovMode('north');
+    const container = mapRef.current?.getContainer();
+    if (container) container.style.transform = 'none';
+    mapRef.current?.dragging.enable();
     setScreen('preview');
   };
 
@@ -362,9 +449,27 @@ function App() {
     }
   };
 
+  const activeRouteForPreview = allRoutes[selectedRouteIndex];
+
+  const ModeRow = () => (
+    <div className="mode-row">
+      {TRANSPORT_ORDER.map((mode) => (
+        <button
+          key={mode}
+          type="button"
+          className={`mode-btn ${transportMode === mode ? 'active' : ''}`}
+          onClick={() => handleModeChange(mode)}
+        >
+          <span className="mode-icon">{TRANSPORT_PROFILES[mode].icon}</span>
+          <span className="mode-label">{TRANSPORT_PROFILES[mode].label}</span>
+        </button>
+      ))}
+    </div>
+  );
+
   return (
     <>
-      <div id="map" />
+      <div id="map" className={mapType === 'satellite' ? 'satellite-mode' : ''} />
 
       {screen === 'search' && (
         <div className="top-search-wrap">
@@ -404,8 +509,13 @@ function App() {
             </div>
           </div>
 
+          <ModeRow />
+
           {status && <div className="toast">{status}</div>}
 
+          <button className="fab maptype-fab" type="button" onClick={toggleMapType} aria-label="Toggle satellite view">
+            {mapType === 'street' ? '🛰️' : '🗺️'}
+          </button>
           <button className="fab locate-fab" type="button" onClick={handleMyLocation} aria-label="Use my location">
             ◎
           </button>
@@ -425,14 +535,17 @@ function App() {
             <div className="sheet-title">{end || 'Destination'}</div>
           </div>
 
+          <ModeRow />
+
           <div className="eta-row">
-            <div className="eta-big">{routeSummary.eta}</div>
+            <div className="eta-big">{loading ? '...' : routeSummary.eta}</div>
             <div className="eta-sub">
               {routeSummary.distance} · arrive {routeSummary.arrival}
             </div>
+            {routeSummary.simulated && <div className="simulated-note">Estimated — no live transit data available</div>}
           </div>
 
-          {trafficNote && (
+          {trafficNote && !routeSummary.simulated && (
             <div className={`traffic-chip traffic-${trafficNote.level}`}>
               {trafficNote.level === 'clear' ? '✅' : trafficNote.level === 'moderate' ? '⚠️' : '🚨'} {trafficNote.label} traffic
             </div>
@@ -458,7 +571,7 @@ function App() {
             </div>
           )}
 
-          <button className="go-btn" type="button" onClick={startDrive}>
+          <button className="go-btn" type="button" onClick={startDrive} disabled={!activeRouteForPreview || loading}>
             GO
           </button>
         </div>
@@ -477,6 +590,17 @@ function App() {
             </button>
           </div>
 
+          <button className="fab maptype-fab drive-pos" type="button" onClick={toggleMapType} aria-label="Toggle satellite view">
+            {mapType === 'street' ? '🛰️' : '🗺️'}
+          </button>
+          <button
+            className="fab pov-fab"
+            type="button"
+            onClick={() => setPovMode((p) => (p === 'north' ? 'heading' : 'north'))}
+            aria-label="Toggle map orientation"
+          >
+            {povMode === 'north' ? '🧭' : '🔼'}
+          </button>
           <button className="fab recenter-fab" type="button" onClick={recenter} aria-label="Recenter">
             ⌖
           </button>
