@@ -36,15 +36,16 @@ html, body, #root {
 body { overflow: hidden; }
 button, input { font: inherit; }
 
-#map { position: fixed; inset: 0; z-index: 0; }
+#map { position: fixed; inset: 0; z-index: 0; overflow: hidden; }
 .leaflet-container { height: 100vh; width: 100vw; background: #d1d5db; }
 
-/* Vivid roads in light mode, inverted "night mode" look in dark mode —
-   the cheap way to get a Waze-ish night map without a custom tile server. */
+/* Vivid roads in light mode, inverted "night mode" look in dark mode. */
 .leaflet-tile { filter: saturate(1.15) contrast(1.05); }
 :root[data-theme='dark'] .leaflet-tile {
   filter: invert(1) hue-rotate(180deg) brightness(0.92) contrast(0.9) saturate(0.9);
 }
+/* Satellite imagery should never get the street-map color filters. */
+.satellite-mode .leaflet-tile { filter: none !important; }
 
 .leaflet-routing-container { display: none; }
 
@@ -156,6 +157,40 @@ button, input { font: inherit; }
   box-shadow: var(--shadow);
 }
 
+/* ---------- Transport mode row ---------- */
+
+.mode-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.mode-btn {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 10px 4px;
+  border-radius: 14px;
+  border: 1.5px solid var(--line);
+  background: var(--panel);
+  cursor: pointer;
+  backdrop-filter: blur(8px);
+  box-shadow: var(--shadow);
+}
+
+.mode-icon { font-size: 18px; }
+.mode-label { font-size: 10px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+
+.mode-btn.active {
+  border-color: var(--blue);
+  background: rgba(59, 130, 246, 0.12);
+}
+.mode-btn.active .mode-label { color: var(--blue); }
+
+/* ---------- Floating buttons ---------- */
+
 .fab {
   position: fixed;
   width: 48px;
@@ -174,7 +209,10 @@ button, input { font: inherit; }
 }
 
 .locate-fab { right: 16px; bottom: 96px; }
-.recenter-fab { right: 16px; bottom: 130px; }
+.maptype-fab { left: 16px; bottom: 96px; }
+.maptype-fab.drive-pos { bottom: 116px; }
+.recenter-fab { right: 16px; bottom: 116px; }
+.pov-fab { right: 16px; bottom: 176px; }
 
 .fab-primary {
   position: fixed;
@@ -218,9 +256,10 @@ button, input { font: inherit; }
 .sheet-header { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
 .sheet-title { font-weight: 800; font-size: 16px; color: var(--ink); }
 
-.eta-row { margin-bottom: 12px; }
+.eta-row { margin: 14px 0 12px; }
 .eta-big { font-size: 38px; font-weight: 800; color: var(--blue); letter-spacing: -1px; }
 .eta-sub { color: var(--muted); font-size: 13px; font-weight: 600; margin-top: 4px; }
+.simulated-note { color: #92400e; font-size: 11px; font-weight: 600; font-style: italic; margin-top: 6px; }
 
 .traffic-chip {
   display: inline-block;
@@ -265,6 +304,7 @@ button, input { font: inherit; }
   box-shadow: 0 14px 30px rgba(59, 130, 246, 0.4);
   cursor: pointer;
 }
+.go-btn:disabled { opacity: 0.6; pointer-events: none; }
 
 /* ---------- Drive HUD (full-screen) ---------- */
 
@@ -318,10 +358,21 @@ button, input { font: inherit; }
 .drive-stat strong { font-size: 15px; color: var(--ink); }
 .drive-stat span { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; font-weight: 700; }
 
-.user-marker-pulse {
-  animation: none;
-  transform: none;
-  opacity: 1;
+/* ---------- User location marker ---------- */
+
+.user-marker-icon { background: transparent; border: none; }
+.user-arrow-shape {
+  width: 30px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 20px;
+  color: #fff;
+  background: linear-gradient(135deg, var(--blue) 0%, var(--blue-dark) 100%);
+  border-radius: 50%;
+  box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.25), 0 4px 10px rgba(15, 23, 42, 0.3);
+  transition: transform 0.25s linear;
 }
 
 @media (max-width: 380px) {
