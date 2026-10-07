@@ -223,7 +223,16 @@ create policy "Group members can view each other's profile"
   );
 
 create policy "Users update their own profile"
-  on public.profiles for update using (auth.uid() = id);
+  on public.profiles for update
+  using (auth.uid() = id)
+  with check (
+    auth.uid() = id
+    and is_anonymous = (
+      select p.is_anonymous
+      from public.profiles p
+      where p.id = auth.uid()
+    )
+  );
 
 -- routes
 create policy "Users manage their own routes"
