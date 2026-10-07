@@ -439,6 +439,15 @@ returns void
 language plpgsql security definer set search_path = public
 as $$
 begin
+  if p_route_id is not null and not exists (
+    select 1
+    from public.routes r
+    where r.id = p_route_id
+      and r.user_id = auth.uid()
+  ) then
+    raise exception 'Route not found or not owned by current user.';
+  end if;
+
   update public.group_members
   set route_id = p_route_id
   where group_id = p_group_id and user_id = auth.uid() and status = 'active';
