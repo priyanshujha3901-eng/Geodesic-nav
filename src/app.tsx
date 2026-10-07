@@ -1,4 +1,5 @@
 import { BrowserRouter, Routes, Route } from 'react-router-dom';
+import { SpeedInsights } from '@vercel/speed-insights/react';
 import { AuthProvider } from './context/AuthContext';
 import HomePage from './pages/HomePage';
 import LoginPage from './pages/LoginPage';
@@ -15,6 +16,7 @@ export default function App() {
           <Route path="/invite/:code" element={<InvitePage />} />
           <Route path="/dashboard" element={<DashboardPage />} />
         </Routes>
+        <SpeedInsights />
       </BrowserRouter>
     </AuthProvider>
   );
