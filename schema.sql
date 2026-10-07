@@ -378,6 +378,15 @@ begin
     raise exception 'This group is full.';
   end if;
 
+  if p_route_id is not null and not exists (
+    select 1
+    from public.routes r
+    where r.id = p_route_id
+      and r.created_by = auth.uid()
+  ) then
+    raise exception 'Invalid route selection.';
+  end if;
+
   insert into public.group_members (group_id, user_id, role, status, route_id)
   values (v_invite.group_id, auth.uid(), 'member', 'active', p_route_id)
   on conflict (group_id, user_id) do update set status = 'active', route_id = excluded.route_id, left_at = null;
