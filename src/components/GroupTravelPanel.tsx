@@ -1,0 +1,1 @@
+export { GroupTravelPanel } from '../grouptravelpanel';

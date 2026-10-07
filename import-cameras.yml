@@ -1,0 +1,24 @@
+name: Import Delhi Cameras
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: '0 3 1 * *' # 1st of each month, 03:00 UTC
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - run: npm ci
+
+      - name: Run camera import
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: node scripts/import-cameras.mjs
