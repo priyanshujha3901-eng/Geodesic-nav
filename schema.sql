@@ -223,7 +223,16 @@ create policy "Group members can view each other's profile"
   );
 
 create policy "Users update their own profile"
-  on public.profiles for update using (auth.uid() = id);
+  on public.profiles for update
+  using (auth.uid() = id)
+  with check (
+    auth.uid() = id
+    and is_anonymous = (
+      select p.is_anonymous
+      from public.profiles p
+      where p.id = auth.uid()
+    )
+  );
 
 -- routes
 create policy "Users manage their own routes"
@@ -378,6 +387,15 @@ begin
     raise exception 'This group is full.';
   end if;
 
+  if p_route_id is not null and not exists (
+    select 1
+    from public.routes r
+    where r.id = p_route_id
+      and r.created_by = auth.uid()
+  ) then
+    raise exception 'Invalid route selection.';
+  end if;
+
   insert into public.group_members (group_id, user_id, role, status, route_id)
   values (v_invite.group_id, auth.uid(), 'member', 'active', p_route_id)
   on conflict (group_id, user_id) do update set status = 'active', route_id = excluded.route_id, left_at = null;
@@ -439,6 +457,15 @@ returns void
 language plpgsql security definer set search_path = public
 as $$
 begin
+  if p_route_id is not null and not exists (
+    select 1
+    from public.routes r
+    where r.id = p_route_id
+      and r.user_id = auth.uid()
+  ) then
+    raise exception 'Route not found or not owned by current user.';
+  end if;
+
   update public.group_members
   set route_id = p_route_id
   where group_id = p_group_id and user_id = auth.uid() and status = 'active';
