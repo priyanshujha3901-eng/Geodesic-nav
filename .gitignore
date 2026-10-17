@@ -3,4 +3,5 @@ dist/
 .env
 .env.*
 !.env.example
-
+supabase/.env.local
+supabase/.env

@@ -1,0 +1,7 @@
+{
+  "nodeModulesDir": "auto",
+  "imports": {
+    "gtfs-realtime-bindings": "npm:gtfs-realtime-bindings@1.1.1",
+    "@supabase/supabase-js": "npm:@supabase/supabase-js@2"
+  }
+}

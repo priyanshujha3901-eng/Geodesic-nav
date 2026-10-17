@@ -3,9 +3,9 @@ import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import 'leaflet-routing-machine/dist/leaflet-routing-machine.css';
 import 'leaflet-routing-machine';
-import { supabase } from './supabase';
+import { supabase } from './supabase.js';
 
-const NAV_ZOOM = 17;
+const NAV_ZOOM = 18;
 const HEADING_SCALE = 1.8;
 
 // RFC 2606 reserves .invalid specifically for "this is not a real,
@@ -93,6 +93,164 @@ const getRouteProgress = (route, userLatLng) => {
   return { nearestIdx, remaining, instruction: upcoming ? { ...upcoming, distanceToManeuver } : null };
 };
 
+// --- route-progress core (start) ---------------------------------------
+// Pure helpers for the grey "travelled" / blue "remaining" route lines.
+// They never modify the route geometry; they only track how far along the
+// original route the user has got (forward-only).
+const PROGRESS_WINDOW_M = 1000;       // only look this far ahead of current progress
+const PROGRESS_MIN_TOLERANCE_M = 60;  // max distance from the route to count as "on it"
+const PROGRESS_MIN_STEP_M = 2;        // ignore tiny movements (GPS noise)
+const ARRIVAL_SNAP_M = 20;            // this close to the end = arrived
+
+const projectOnSegment = (pt, a, b) => {
+  const k = Math.cos((a.lat * Math.PI) / 180);
+  const dx = (b.lng - a.lng) * k;
+  const dy = b.lat - a.lat;
+  const len2 = dx * dx + dy * dy;
+  let t = len2 === 0 ? 0 : (((pt.lng - a.lng) * k) * dx + (pt.lat - a.lat) * dy) / len2;
+  t = Math.max(0, Math.min(1, t));
+  return { t, point: L.latLng(a.lat + (b.lat - a.lat) * t, a.lng + (b.lng - a.lng) * t) };
+};
+
+const buildRouteProgress = (coords) => {
+  const cum = [0];
+  for (let i = 1; i < coords.length; i++) cum.push(cum[i - 1] + coords[i - 1].distanceTo(coords[i]));
+  return { coords, cum, total: cum[cum.length - 1], along: 0, seg: 0, point: coords[0] };
+};
+
+// Returns true when progress moved forward. Never moves backward.
+const advanceRouteProgress = (p, userLatLng, accuracy) => {
+  if (p.along >= p.total) return false;
+  const tolerance = Math.max(PROGRESS_MIN_TOLERANCE_M, accuracy || 0);
+  let best = null;
+  for (let i = p.seg; i < p.coords.length - 1; i++) {
+    if (p.cum[i] - p.along > PROGRESS_WINDOW_M) break;
+    const proj = projectOnSegment(userLatLng, p.coords[i], p.coords[i + 1]);
+    const dist = userLatLng.distanceTo(proj.point);
+    if (dist > tolerance) continue;
+    const along = p.cum[i] + proj.t * (p.cum[i + 1] - p.cum[i]);
+    // small penalty for far-ahead matches so loops / out-and-back roads don't cause jumps
+    const score = dist + 0.01 * Math.max(0, along - p.along);
+    if (!best || score < best.score) best = { i, point: proj.point, along, score };
+  }
+  if (!best) return false;
+  if (p.total - best.along <= ARRIVAL_SNAP_M) {
+    best = { i: p.coords.length - 2, point: p.coords[p.coords.length - 1], along: p.total };
+  }
+  if (best.along <= p.along) return false;
+  if (best.along < p.total && best.along - p.along < PROGRESS_MIN_STEP_M) return false;
+  p.along = best.along;
+  p.seg = best.i;
+  p.point = best.point;
+  return true;
+};
+
+const progressPolylines = (p) => {
+  if (p.along <= 0) return { travelled: [], remaining: p.coords };
+  return {
+    travelled: [...p.coords.slice(0, p.seg + 1), p.point],
+    remaining: p.along >= p.total ? [] : [p.point, ...p.coords.slice(p.seg + 1)],
+  };
+};
+// --- route-progress core (end) -----------------------------------------
+
+// CCTV-style camera glyph (inline SVG, no external file)
+const CCTV_SVG = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8l12-4 2 6-12 4z" fill="#fff" fill-opacity=".25"/><path d="M17 10l4 1.5"/><path d="M8 14l-1 3h4"/><path d="M9 20h8"/></svg>';
+
+// --- route-camera core (start) -----------------------------------------
+const ROUTE_CAMERA_MAX_DISTANCE_M = 75; // a camera this close to the route line counts as "near the route"
+const ROUTE_CAMERA_FIELDS = 'id, latitude, longitude, road_name, camera_type, source, confidence, last_verified_at';
+// While a route is shown, hide the city-wide camera dots so only cameras near the route remain.
+// Set to false to keep the old city-wide dots visible during a route as well.
+const HIDE_CITY_CAMERAS_DURING_ROUTE = true;
+
+const escapeHtml = (v) =>
+  String(v).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+// Cameras within maxM of the route polyline, sorted by distance along the route.
+// `cum` is the cumulative route distance per vertex (from buildRouteProgress).
+const matchCamerasToRoute = (coords, cum, cameras, maxM) => {
+  const n = coords.length;
+  if (n < 2) return [];
+  const lat0 = coords[0].lat;
+  const lng0 = coords[0].lng;
+  const kx = Math.cos((lat0 * Math.PI) / 180) * 111320;
+  const ky = 110574;
+  const xs = new Float64Array(n);
+  const ys = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    xs[i] = (coords[i].lng - lng0) * kx;
+    ys[i] = (coords[i].lat - lat0) * ky;
+  }
+  const out = [];
+  for (const cam of cameras) {
+    const lat = Number(cam.latitude);
+    const lng = Number(cam.longitude);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+    const cx = (lng - lng0) * kx;
+    const cy = (lat - lat0) * ky;
+    let bestD2 = maxM * maxM + 1e-9;
+    let bestAlong = -1;
+    for (let i = 0; i < n - 1; i++) {
+      const x1 = xs[i], y1 = ys[i], x2 = xs[i + 1], y2 = ys[i + 1];
+      if (cx < Math.min(x1, x2) - maxM || cx > Math.max(x1, x2) + maxM) continue;
+      if (cy < Math.min(y1, y2) - maxM || cy > Math.max(y1, y2) + maxM) continue;
+      const dx = x2 - x1, dy = y2 - y1, len2 = dx * dx + dy * dy;
+      let t = len2 === 0 ? 0 : ((cx - x1) * dx + (cy - y1) * dy) / len2;
+      t = Math.max(0, Math.min(1, t));
+      const px = x1 + t * dx, py = y1 + t * dy;
+      const d2 = (cx - px) * (cx - px) + (cy - py) * (cy - py);
+      if (d2 < bestD2) { bestD2 = d2; bestAlong = cum[i] + t * (cum[i + 1] - cum[i]); }
+    }
+    if (bestAlong >= 0) out.push({ camera: { ...cam, latitude: lat, longitude: lng }, along: bestAlong, distance: Math.sqrt(bestD2) });
+  }
+  out.sort((a, b) => a.along - b.along);
+  return out;
+};
+
+const routeCameraPopupHtml = (c) =>
+  `<strong>${escapeHtml(String(c.camera_type || 'unknown').replace('_', ' '))}</strong><br/>` +
+  (c.road_name ? `${escapeHtml(c.road_name)}<br/>` : '') +
+  `Near selected route<br/>Source: ${escapeHtml(c.source)} · Confidence: ${escapeHtml(c.confidence)}` +
+  (c.last_verified_at ? `<br/>Last verified: ${escapeHtml(new Date(c.last_verified_at).toLocaleDateString())}` : '') +
+  `<br/><small>Camera locations are based on public information and OpenStreetMap data. They may be incomplete or inaccurate. Always follow traffic rules.</small>`;
+// --- route-camera core (end) -------------------------------------------
+
+// --- live-bus core (start) ---------------------------------------------
+const BUS_REFRESH_MS = 12000;  // live bus refresh while Bus mode is selected
+const BUS_DETAIL_MAX = 800;    // more buses than this in view -> light dots instead of labelled icons
+
+// Keeps only vehicles with a usable position; key = stable id so markers can be reused.
+const normalizeBusVehicles = (vehicles) => {
+  const next = new Map();
+  (vehicles || []).forEach((v, i) => {
+    const lat = Number(v.latitude);
+    const lng = Number(v.longitude);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+    if (Math.abs(lat) > 90 || Math.abs(lng) > 180 || (lat === 0 && lng === 0)) return;
+    next.set(String(v.vehicleId || v.vehicleLabel || v.tripId || `anon-${i}`), { ...v, latitude: lat, longitude: lng });
+  });
+  return next;
+};
+
+// Only real data: route id if the feed has one, else the vehicle label, else nothing.
+const busLabel = (b) => String(b.routeId || b.vehicleLabel || '').trim();
+
+const busPopupHtml = (b) => {
+  const rows = ['<strong>Bus</strong>'];
+  if (b.vehicleLabel) rows.push(`Vehicle: ${escapeHtml(b.vehicleLabel)}`);
+  if (b.vehicleId && b.vehicleId !== b.vehicleLabel) rows.push(`Vehicle ID: ${escapeHtml(b.vehicleId)}`);
+  if (b.routeId) rows.push(`Route ID: ${escapeHtml(b.routeId)}`);
+  if (Number.isFinite(Number(b.timestamp)) && Number(b.timestamp) > 0) {
+    rows.push(`Last updated: ${escapeHtml(new Date(Number(b.timestamp) * 1000).toLocaleTimeString())}`);
+  }
+  if (b.speed != null && Number.isFinite(Number(b.speed))) rows.push(`Speed: ${Math.round(Number(b.speed) * 3.6)} km/h`);
+  if (b.bearing != null && Number.isFinite(Number(b.bearing))) rows.push(`Bearing: ${Math.round(Number(b.bearing))}°`);
+  rows.push('<small>Data: Delhi Open Transit Data</small>');
+  return rows.join('<br/>');
+};
+// --- live-bus core (end) -----------------------------------------------
+
 function App() {
   const mapRef = useRef(null);
   const routeControlRef = useRef(null);
@@ -108,6 +266,17 @@ function App() {
   const lastStartCoordsRef = useRef(null);
   const lastEndCoordsRef = useRef(null);
   const povModeRef = useRef('north');
+  const routeProgressRef = useRef(null);      // { coords (original route), cum, total, along, seg, point }
+  const progressLinesRef = useRef(null);      // { travelled, remaining } Leaflet polylines
+  const previewLineStylesRef = useRef(null);  // saved opacities of the routing-machine preview line
+  const flyingRef = useRef(false);            // true while the GO flyTo animation runs
+  const routeCamerasLayerRef = useRef(L.layerGroup()); // cameras near the selected route
+  const routeCamerasRef = useRef({ items: [], markers: [], passed: 0, req: 0 });
+  const busLayerRef = useRef(L.layerGroup());   // live bus markers (Bus mode only)
+  const busesRef = useRef(new Map());           // latest feed data, key -> bus
+  const busMarkersRef = useRef(new Map());      // key -> labelled L.marker
+  const busDotsRef = useRef(new Map());         // key -> light canvas dot (very crowded views)
+  const busCanvasRef = useRef(null);
 
   const [theme, setTheme] = useState(() => localStorage.getItem('geodesic-theme') || 'light');
   const [screen, setScreen] = useState('search');
@@ -128,6 +297,8 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [alertsOn, setAlertsOn] = useState(true);
   const [currentRouteId, setCurrentRouteId] = useState(null);
+  const [routeActive, setRouteActive] = useState(false);  // a route is currently shown (preview / drive)
+  const [busStatus, setBusStatus] = useState('idle');     // idle | loading | live | error
 
   // --- Auth state ---
   const [authUser, setAuthUser] = useState(null);
@@ -164,6 +335,9 @@ function App() {
   useEffect(() => {
     const map = L.map('map', { zoomControl: false }).setView([28.7041, 77.1025], 13);
     mapRef.current = map;
+    // Stacking: route lines (overlayPane 400) < buses 585 < route cameras 590 < live-location / group markers (markerPane 600)
+    map.createPane('busPane').style.zIndex = '585';
+    map.createPane('routeCameras').style.zIndex = '590';
 
     streetLayerRef.current = L.tileLayer(MAP_LAYERS.street.url, { maxZoom: 19, attribution: MAP_LAYERS.street.attribution });
     satelliteLayerRef.current = L.tileLayer(MAP_LAYERS.satellite.url, { maxZoom: 19, attribution: MAP_LAYERS.satellite.attribution });
@@ -295,9 +469,12 @@ function App() {
 
   useEffect(() => {
     if (!mapRef.current) return;
-    if (alertsOn) camerasLayerRef.current.addTo(mapRef.current);
+    const showCity = alertsOn && !(HIDE_CITY_CAMERAS_DURING_ROUTE && routeActive);
+    if (showCity) camerasLayerRef.current.addTo(mapRef.current);
     else mapRef.current.removeLayer(camerasLayerRef.current);
-  }, [alertsOn]);
+    if (alertsOn) routeCamerasLayerRef.current.addTo(mapRef.current);
+    else mapRef.current.removeLayer(routeCamerasLayerRef.current);
+  }, [alertsOn, routeActive]);
 
   const ensureUserMarker = (coords) => {
     if (userMarkerRef.current) {
@@ -342,7 +519,285 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [povMode]);
 
+  // --- Route progress: grey travelled / blue remaining lines (drive mode only) ---
+  // The full route stays untouched in selectedRouteRef / routeProgressRef.coords.
+  // Only the two display polylines are updated, with setLatLngs().
+  const setPreviewRouteVisible = (visible) => {
+    const map = mapRef.current;
+    if (!map) return;
+    if (visible) {
+      (previewLineStylesRef.current || []).forEach(([poly, opacity]) => poly.setStyle({ opacity }));
+      previewLineStylesRef.current = null;
+      return;
+    }
+    if (previewLineStylesRef.current) return;
+    const saved = [];
+    map.eachLayer((layer) => {
+      if (layer instanceof L.Routing.Line) {
+        layer.eachLayer((poly) => {
+          saved.push([poly, poly.options.opacity]);
+          poly.setStyle({ opacity: 0 });
+        });
+      }
+    });
+    previewLineStylesRef.current = saved;
+  };
+
+  const clearRouteProgress = () => {
+    if (progressLinesRef.current) {
+      mapRef.current?.removeLayer(progressLinesRef.current.travelled);
+      mapRef.current?.removeLayer(progressLinesRef.current.remaining);
+      progressLinesRef.current = null;
+    }
+    routeProgressRef.current = null;
+    resetRouteCameraDimming();
+    setPreviewRouteVisible(true);
+  };
+
+  const renderRouteProgress = () => {
+    const p = routeProgressRef.current;
+    if (!p || !mapRef.current) return;
+    if (!progressLinesRef.current) {
+      const base = { interactive: false, lineCap: 'round', lineJoin: 'round', weight: 8 };
+      progressLinesRef.current = {
+        travelled: L.polyline([], { ...base, color: '#6B7280', opacity: 0.9 }).addTo(mapRef.current),
+        remaining: L.polyline([], { ...base, color: '#3b82f6', opacity: 1 }).addTo(mapRef.current),
+      };
+    }
+    const { travelled, remaining } = progressPolylines(p);
+    progressLinesRef.current.travelled.setLatLngs(travelled);
+    progressLinesRef.current.remaining.setLatLngs(remaining);
+    updatePassedRouteCameras(p.along);
+  };
+
+  const startRouteProgress = (route, userLatLng) => {
+    clearRouteProgress();
+    if (!route.coordinates || route.coordinates.length < 2) return;
+    setPreviewRouteVisible(false);
+    routeProgressRef.current = buildRouteProgress(route.coordinates);
+    advanceRouteProgress(routeProgressRef.current, userLatLng, 0);
+    renderRouteProgress();
+  };
+
+  const updateRouteProgress = (userLatLng, accuracy) => {
+    const p = routeProgressRef.current;
+    if (p && advanceRouteProgress(p, userLatLng, accuracy)) renderRouteProgress();
+  };
+
+  // --- Cameras near the selected route (matched once per route, not per GPS fix) ---
+  const clearRouteCameras = () => {
+    const rc = routeCamerasRef.current;
+    rc.req += 1; // invalidates any lookup still in flight
+    routeCamerasLayerRef.current.clearLayers();
+    rc.items = [];
+    rc.markers = [];
+    rc.passed = 0;
+  };
+
+  const resetRouteCameraDimming = () => {
+    const rc = routeCamerasRef.current;
+    rc.markers.forEach((m) => m.setOpacity(1));
+    rc.passed = 0;
+  };
+
+  // Cameras already behind the user are dimmed (not removed); the ones ahead stay full strength.
+  const updatePassedRouteCameras = (along) => {
+    const rc = routeCamerasRef.current;
+    while (rc.passed < rc.items.length && rc.items[rc.passed].along < along - 15) {
+      rc.markers[rc.passed].setOpacity(0.4);
+      rc.passed += 1;
+    }
+  };
+
+  const renderRouteCameras = (matched) => {
+    const rc = routeCamerasRef.current;
+    rc.items = matched;
+    rc.markers = matched.map(({ camera }) => {
+      const color = CAMERA_COLORS[camera.camera_type] || CAMERA_COLORS.unknown;
+      const marker = L.marker([camera.latitude, camera.longitude], {
+        pane: 'routeCameras',
+        keyboard: false,
+        icon: L.divIcon({
+          className: 'route-camera-icon',
+          html: `<div class="route-camera-pin" style="background:${color}">${CCTV_SVG}</div>`,
+          iconSize: [28, 28],
+          iconAnchor: [14, 14],
+        }),
+      }).bindPopup(routeCameraPopupHtml(camera));
+      routeCamerasLayerRef.current.addLayer(marker);
+      return marker;
+    });
+    rc.passed = 0;
+    if (routeProgressRef.current) updatePassedRouteCameras(routeProgressRef.current.along);
+  };
+
+  const updateRouteCameras = async (route) => {
+    clearRouteCameras();
+    const token = routeCamerasRef.current.req;
+    const coords = route?.coordinates;
+    if (!coords || coords.length < 2) return;
+    try {
+      // Ask Supabase only for cameras inside the route's bounding box, then match exactly.
+      let minLat = Infinity, maxLat = -Infinity, minLng = Infinity, maxLng = -Infinity;
+      coords.forEach((c) => {
+        if (c.lat < minLat) minLat = c.lat;
+        if (c.lat > maxLat) maxLat = c.lat;
+        if (c.lng < minLng) minLng = c.lng;
+        if (c.lng > maxLng) maxLng = c.lng;
+      });
+      const padLat = 0.0012;
+      const padLng = padLat / Math.cos(((minLat + maxLat) / 2 * Math.PI) / 180);
+      const rows = [];
+      for (let from = 0; from < 10000; from += 1000) {
+        const { data, error } = await supabase
+          .from('cameras')
+          .select(ROUTE_CAMERA_FIELDS)
+          .eq('city', 'Delhi')
+          .gte('latitude', minLat - padLat).lte('latitude', maxLat + padLat)
+          .gte('longitude', minLng - padLng).lte('longitude', maxLng + padLng)
+          .order('id')
+          .range(from, from + 999);
+        if (token !== routeCamerasRef.current.req) return; // route changed meanwhile
+        if (error) throw error;
+        rows.push(...(data || []));
+        if (!data || data.length < 1000) break;
+      }
+      const { cum } = buildRouteProgress(coords);
+      renderRouteCameras(matchCamerasToRoute(coords, cum, rows, ROUTE_CAMERA_MAX_DISTANCE_M));
+    } catch (e) {
+      console.error('Route cameras unavailable:', e?.message || 'unknown error');
+    }
+  };
+
+  // Leaving the route view (Back to search) cancels the route cameras.
+  useEffect(() => {
+    if (screen === 'search') {
+      clearRouteCameras();
+      setRouteActive(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [screen]);
+
+  useEffect(() => () => { routeCamerasRef.current.req += 1; }, []);
+
+  // --- Live Delhi buses (only while Bus mode is selected) ---
+  const clearBuses = () => {
+    busLayerRef.current.clearLayers();
+    busMarkersRef.current.clear();
+    busDotsRef.current.clear();
+    busesRef.current = new Map();
+    mapRef.current?.removeLayer(busLayerRef.current);
+  };
+
+  const busIcon = (label) =>
+    L.divIcon({
+      className: 'bus-marker-icon',
+      html: `<div class="bus-marker">${label ? `<span class="bus-label">${escapeHtml(label)}</span>` : ''}<span class="bus-glyph">🚌</span></div>`,
+      iconSize: [40, 40],
+      iconAnchor: [20, 32],
+    });
+
+  // Draws buses inside the (padded) view. Few buses -> labelled icons. Very crowded view
+  // (e.g. whole Delhi) -> light canvas dots, so nothing is discarded and the browser stays fast.
+  const renderBuses = () => {
+    const map = mapRef.current;
+    if (!map) return;
+    const bounds = map.getBounds().pad(0.3);
+    const visible = [];
+    busesRef.current.forEach((b, key) => {
+      if (bounds.contains([b.latitude, b.longitude])) visible.push([key, b]);
+    });
+    const detailed = visible.length <= BUS_DETAIL_MAX;
+    const wanted = new Set(visible.map(([key]) => key));
+    const markers = busMarkersRef.current;
+    const dots = busDotsRef.current;
+    const layer = busLayerRef.current;
+
+    markers.forEach((m, key) => { if (!detailed || !wanted.has(key)) { layer.removeLayer(m); markers.delete(key); } });
+    dots.forEach((d, key) => { if (detailed || !wanted.has(key)) { layer.removeLayer(d); dots.delete(key); } });
+
+    visible.forEach(([key, b]) => {
+      const latlng = [b.latitude, b.longitude];
+      const popup = () => busPopupHtml(busesRef.current.get(key) || b);
+      if (detailed) {
+        const label = busLabel(b);
+        const existing = markers.get(key);
+        if (existing) {
+          existing.setLatLng(latlng);
+          if (existing._busLabel !== label) { existing.setIcon(busIcon(label)); existing._busLabel = label; }
+        } else {
+          const m = L.marker(latlng, { icon: busIcon(label), pane: 'busPane', keyboard: false }).bindPopup(popup);
+          m._busLabel = label;
+          layer.addLayer(m);
+          markers.set(key, m);
+        }
+      } else {
+        const existing = dots.get(key);
+        if (existing) {
+          existing.setLatLng(latlng);
+        } else {
+          if (!busCanvasRef.current) busCanvasRef.current = L.canvas({ pane: 'busPane' });
+          const d = L.circleMarker(latlng, {
+            renderer: busCanvasRef.current, radius: 4, weight: 1, color: '#ffffff', fillColor: '#0d9488', fillOpacity: 0.9,
+          }).bindPopup(popup);
+          layer.addLayer(d);
+          dots.set(key, d);
+        }
+      }
+    });
+  };
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (transportMode !== 'bus' || !map) return undefined;
+    let cancelled = false;
+    let inFlight = false;
+    let moveTimer = null;
+    busLayerRef.current.addTo(map);
+    setBusStatus('loading');
+
+    const load = async () => {
+      if (inFlight) return; // never overlap requests
+      inFlight = true;
+      try {
+        const { data, error } = await supabase.functions.invoke('delhi-bus-positions');
+        if (cancelled) return;
+        if (error || !data || !Array.isArray(data.vehicles)) throw new Error('unavailable');
+        const next = normalizeBusVehicles(data.vehicles);
+        if (next.size === 0) throw new Error('unavailable');
+        busesRef.current = next;
+        setBusStatus('live');
+        renderBuses();
+      } catch {
+        if (cancelled) return;
+        clearBuses();
+        busLayerRef.current.addTo(map);
+        setBusStatus('error');
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    const onMove = () => { clearTimeout(moveTimer); moveTimer = setTimeout(renderBuses, 200); };
+    map.on('moveend', onMove);
+    load();
+    const timer = setInterval(load, BUS_REFRESH_MS);
+
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+      clearTimeout(moveTimer);
+      map.off('moveend', onMove);
+      clearBuses();
+      setBusStatus('idle');
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [transportMode]);
+
   const applyRouteSelection = (route) => {
+    clearRouteProgress(); // new route selected: drop old progress, show it fully blue
+    setRouteActive(true);
+    updateRouteCameras(route); // cameras near THIS route (replaces any previous set)
     selectedRouteRef.current = route;
     const distanceKm = (route.summary.totalDistance / 1000).toFixed(1);
     const etaText = formatMinutes(route.summary.totalTime / 60);
@@ -485,7 +940,13 @@ function App() {
     lastHeadingCoordsRef.current = initialPoint;
     headingRef.current = 0;
     setPovMode('north');
-    mapRef.current.setView(initialPoint, NAV_ZOOM, { animate: true });
+    // Smooth fly to the live location at driving zoom. GPS panning is paused
+    // until the flight ends, because panTo()/setView() would cancel it midway.
+    flyingRef.current = true;
+    mapRef.current.flyTo([initialPoint.lat, initialPoint.lng], NAV_ZOOM, { animate: true, duration: 1.2 });
+    mapRef.current.once('moveend', () => { flyingRef.current = false; });
+    setTimeout(() => { flyingRef.current = false; }, 1600);
+    startRouteProgress(route, initialPoint);
 
     const progress = getRouteProgress(route, initialPoint);
     setCurrentInstruction(progress.instruction);
@@ -499,6 +960,7 @@ function App() {
   };
 
   const endDrive = () => {
+    clearRouteProgress();
     setPovMode('north');
     const container = mapRef.current?.getContainer();
     if (container) container.style.transform = 'none';
@@ -523,7 +985,9 @@ function App() {
         ensureUserMarker(coords);
 
         if (screen === 'drive') {
-          mapRef.current.setView(coords, NAV_ZOOM, { animate: true, duration: 0.5 });
+          // follow the user, keep whatever zoom they have (and don't interrupt the flyTo)
+          if (!flyingRef.current) mapRef.current.panTo(coords, { animate: true, duration: 0.5 });
+          updateRouteProgress(coords, position.coords.accuracy);
           if (lastHeadingCoordsRef.current && coords.distanceTo(lastHeadingCoordsRef.current) > 3) {
             const bearing = computeBearing(lastHeadingCoordsRef.current, coords);
             headingRef.current = bearing;
@@ -723,14 +1187,17 @@ function App() {
   };
 
   const ModeRow = () => (
-    <div className="mode-row">
-      {TRANSPORT_ORDER.map((mode) => (
-        <button key={mode} type="button" className={`mode-btn ${transportMode === mode ? 'active' : ''}`} onClick={() => handleModeChange(mode)}>
-          <span className="mode-icon">{TRANSPORT_PROFILES[mode].icon}</span>
-          <span className="mode-label">{TRANSPORT_PROFILES[mode].label}</span>
-        </button>
-      ))}
-    </div>
+    <>
+      <div className="mode-row">
+        {TRANSPORT_ORDER.map((mode) => (
+          <button key={mode} type="button" className={`mode-btn ${transportMode === mode ? 'active' : ''}`} onClick={() => handleModeChange(mode)}>
+            <span className="mode-icon">{TRANSPORT_PROFILES[mode].icon}</span>
+            <span className="mode-label">{TRANSPORT_PROFILES[mode].label}</span>
+          </button>
+        ))}
+      </div>
+      {transportMode === 'bus' && busStatus === 'error' && <div className="toast">Live bus data temporarily unavailable.</div>}
+    </>
   );
 
   return (
@@ -789,7 +1256,11 @@ function App() {
           <div className="eta-row">
             <div className="eta-big">{loading ? '...' : routeSummary.eta}</div>
             <div className="eta-sub">{routeSummary.distance} · arrive {routeSummary.arrival}</div>
-            {routeSummary.simulated && <div className="simulated-note">Estimated — no live transit data available</div>}
+            {routeSummary.simulated && (
+              <div className="simulated-note">
+                {busStatus === 'live' ? 'Estimated trip time — live bus positions shown on the map' : 'Estimated — no live transit data available'}
+              </div>
+            )}
           </div>
 
           {trafficNote && !routeSummary.simulated && (

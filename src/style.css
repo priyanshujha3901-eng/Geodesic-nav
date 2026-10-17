@@ -251,3 +251,16 @@ button, input { font: inherit; }
   .eta-big { font-size: 32px; }
   .fab-primary { font-size: 14px; }
 }
+
+/* ---------- Route cameras + live buses (map markers) ---------- */
+.route-camera-icon, .bus-marker-icon { background: transparent; border: none; }
+.route-camera-pin {
+  width: 28px; height: 28px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+  font-size: 12px; border: 2px solid #fff; box-shadow: 0 2px 6px rgba(15, 23, 42, 0.35);
+}
+.bus-marker { display: flex; flex-direction: column; align-items: center; width: 40px; }
+.bus-label {
+  max-width: 40px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 0 4px; border-radius: 8px;
+  background: rgba(15, 23, 42, 0.85); color: #fff; font-size: 9px; font-weight: 800; line-height: 13px;
+}
+.bus-glyph { font-size: 18px; line-height: 20px; filter: drop-shadow(0 1px 2px rgba(15, 23, 42, 0.5)); }
