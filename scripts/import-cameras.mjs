@@ -50,13 +50,31 @@ async function fetchOverpassCameras() {
   `;
 
   const res = await fetch('https://overpass-api.de/api/interpreter', {
-    method: 'POST',
-    headers: { 'Content-Type': 'text/plain' },
-    body: query,
-  });
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/x-www-form-urlencoded',
+    'Accept': 'application/json',
+    'User-Agent':
+      'GeodesicCameraImport/1.0 (+https://github.com/priyanshujha3901-eng/Geodesic-nav)',
+  },
+  body: new URLSearchParams({ data: query }).toString(),
+  signal: AbortSignal.timeout(90000),
+});
 
-  if (!res.ok) throw new Error(`Overpass API request failed: ${res.status}`);
-  const data = await res.json();
+if (!res.ok) {
+  const details = await res.text();
+
+  throw new Error(
+    `Overpass API request failed: ${res.status}. ` +
+    details.slice(0, 1000)
+  );
+}
+
+const data = await res.json();
+
+if (data.remark) {
+  throw new Error(`Overpass query reported a problem: ${data.remark}`);
+}
 
   return (data.elements ?? []).map((el) => {
     const tags = el.tags ?? {};
@@ -176,7 +194,13 @@ async function upsertCameras(newCameras) {
   for (let i = 0; i < toInsert.length; i += BATCH) {
     const chunk = toInsert.slice(i, i + BATCH);
     const { error } = await supabase.from('cameras').insert(chunk);
-    if (error) console.error(`Batch insert failed (rows ${i}-${i + chunk.length}):`, error.message);
+    if (error) {
+        throw new Error(
+    `  Batch insert failed (rows ${i}-${i + chunk.length}): ${error.message}`
+     );
+}
+
+console.log(`Inserted ${chunk.length} camera records.`);
   }
 }
 
@@ -185,12 +209,8 @@ async function main() {
   const osmCameras = await fetchOverpassCameras();
   console.log(`Found ${osmCameras.length} candidate cameras from OSM.`);
 
-  console.log('Attempting Delhi Traffic Police camera list...');
-  const policeEntries = await scrapeDelhiPolice();
-  console.log(`Found ${policeEntries.length} candidate entries from Delhi Police page.`);
-  const policeCameras = policeEntries.length ? await geocodeDelhiPoliceEntries(policeEntries) : [];
-
-  const allCameras = [...osmCameras, ...policeCameras];
+  console.log('Using OSM only for this import.');
+  const allCameras = osmCameras;
   if (!allCameras.length) {
     console.log('No cameras found from either source. Nothing to import.');
     return;
