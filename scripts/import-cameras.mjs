@@ -176,7 +176,13 @@ async function upsertCameras(newCameras) {
   for (let i = 0; i < toInsert.length; i += BATCH) {
     const chunk = toInsert.slice(i, i + BATCH);
     const { error } = await supabase.from('cameras').insert(chunk);
-    if (error) console.error(`Batch insert failed (rows ${i}-${i + chunk.length}):`, error.message);
+    if (error) {
+        throw new Error(
+    `  Batch insert failed (rows ${i}-${i + chunk.length}): ${error.message}`
+     );
+}
+
+console.log(`Inserted ${chunk.length} camera records.`);
   }
 }
 
@@ -185,12 +191,8 @@ async function main() {
   const osmCameras = await fetchOverpassCameras();
   console.log(`Found ${osmCameras.length} candidate cameras from OSM.`);
 
-  console.log('Attempting Delhi Traffic Police camera list...');
-  const policeEntries = await scrapeDelhiPolice();
-  console.log(`Found ${policeEntries.length} candidate entries from Delhi Police page.`);
-  const policeCameras = policeEntries.length ? await geocodeDelhiPoliceEntries(policeEntries) : [];
-
-  const allCameras = [...osmCameras, ...policeCameras];
+  console.log('Using OSM only for this import.');
+  const allCameras = osmCameras;
   if (!allCameras.length) {
     console.log('No cameras found from either source. Nothing to import.');
     return;
