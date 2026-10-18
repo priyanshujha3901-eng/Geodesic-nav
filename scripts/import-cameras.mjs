@@ -50,13 +50,31 @@ async function fetchOverpassCameras() {
   `;
 
   const res = await fetch('https://overpass-api.de/api/interpreter', {
-    method: 'POST',
-    headers: { 'Content-Type': 'text/plain' },
-    body: query,
-  });
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/x-www-form-urlencoded',
+    'Accept': 'application/json',
+    'User-Agent':
+      'GeodesicCameraImport/1.0 (+https://github.com/priyanshujha3901-eng/Geodesic-nav)',
+  },
+  body: new URLSearchParams({ data: query }).toString(),
+  signal: AbortSignal.timeout(90000),
+});
 
-  if (!res.ok) throw new Error(`Overpass API request failed: ${res.status}`);
-  const data = await res.json();
+if (!res.ok) {
+  const details = await res.text();
+
+  throw new Error(
+    `Overpass API request failed: ${res.status}. ` +
+    details.slice(0, 1000)
+  );
+}
+
+const data = await res.json();
+
+if (data.remark) {
+  throw new Error(`Overpass query reported a problem: ${data.remark}`);
+}
 
   return (data.elements ?? []).map((el) => {
     const tags = el.tags ?? {};
