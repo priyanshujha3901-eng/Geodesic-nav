@@ -3,7 +3,8 @@ import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import 'leaflet-routing-machine/dist/leaflet-routing-machine.css';
 import 'leaflet-routing-machine';
-import { supabase } from './supabase.js';
+import { supabase } from './supabase';
+import { REPORT_CATEGORIES, REPORT_CATEGORY_BY_ID, REPORT_BUTTON_ICON_INNER, iconSvg, reportIconSvg } from './reportIcons';
 
 const NAV_ZOOM = 18;
 const HEADING_SCALE = 1.8;
@@ -31,6 +32,60 @@ const MAP_LAYERS = {
 };
 
 const CAMERA_COLORS = { speed: '#f97316', red_light: '#ef4444', average_speed: '#a855f7', unknown: '#64748b' };
+
+// --- community reports: constants and pure helpers ---------------------
+const REPORT_MIN_ZOOM = 9;                  // speed cameras load for the visible area from this zoom up
+const REPORT_ROUTE_MAX_DISTANCE_M = 100;    // hazards must be this close to the selected route to show
+const REPORT_VOTE_RADIUS_M = 300;           // keep equal to vote_report() on the server
+const REPORT_REFRESH_MS = 60000;
+const REPORT_FIX_MAX_AGE_MS = 15000;        // an older GPS fix counts as stale
+const REPORT_FIX_MAX_ACCURACY_M = 100;      // a worse fix counts as unreliable
+const REPORT_SAVE_TIMEOUT_MS = 15000;
+const REPORT_DESC_MAX = 80;
+
+const newRequestId = () =>
+  (typeof crypto !== 'undefined' && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+        const r = (Math.random() * 16) | 0;
+        return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
+      });
+
+const withTimeout = (promise, ms) =>
+  new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject({ timeout: true }), ms);
+    promise.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
+  });
+
+// Server rule messages (raise exception) arrive with SQLSTATE P0001; anything else gets a generic text.
+const reportErrorText = (error, fallback) =>
+  (error && error.code === 'P0001' && error.message) ? error.message : fallback;
+
+const reportAgo = (iso) => {
+  const mins = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 60000));
+  if (!Number.isFinite(mins)) return 'a while ago';
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins} min ago`;
+  const h = Math.round(mins / 60);
+  return h < 24 ? `${h} h ago` : `${Math.round(h / 24)} d ago`;
+};
+
+const draftPinHtml = (id) => {
+  const c = REPORT_CATEGORY_BY_ID[id] || REPORT_CATEGORY_BY_ID.other;
+  return `<div class="report-draft-pin" style="--pin:${c.color}"><span>${reportIconSvg(id, 22)}</span></div>`;
+};
+
+const reportMarkerIcon = (r) => {
+  const c = REPORT_CATEGORY_BY_ID[r.category] || REPORT_CATEGORY_BY_ID.other;
+  const cls = ['report-pin', r.status === 'dimmed' ? 'dimmed' : '', r.status === 'community_confirmed' ? 'confirmed' : 'unconfirmed', r.is_mine ? 'mine' : ''].join(' ');
+  return L.divIcon({
+    className: 'report-marker-icon',
+    html: `<div class="${cls}" style="background:${c.color}">${reportIconSvg(r.category, 18)}</div>`,
+    iconSize: [32, 32],
+    iconAnchor: [16, 16],
+  });
+};
+
 
 const getTrafficCondition = () => {
   const rand = Math.random();
@@ -272,6 +327,26 @@ function App() {
   const flyingRef = useRef(false);            // true while the GO flyTo animation runs
   const routeCamerasLayerRef = useRef(L.layerGroup()); // cameras near the selected route
   const routeCamerasRef = useRef({ items: [], markers: [], passed: 0, req: 0 });
+  // community reports
+  const reportsLayerRef = useRef(null);
+  const reportMarkersRef = useRef(new Map());
+  const viewportRowsRef = useRef([]);
+  const routeRowsRef = useRef([]);
+  const mineRowsRef = useRef([]);
+  const dismissedIdsRef = useRef(new Set());
+  const reportsReqRef = useRef(0);
+  const reportApiRef = useRef({});
+  const reportPhaseRef = useRef('idle');
+  const placingReportRef = useRef(false);
+  const draftMarkerRef = useRef(null);
+  const draftLatLngRef = useRef(null);
+  const reportRequestIdRef = useRef(null);
+  const locateSeqRef = useRef(0);
+  const justDraggedRef = useRef(0);
+  const prevPovRef = useRef(null);
+  const reportToastTimerRef = useRef(null);
+  const routeActiveRef = useRef(false);
+  const alertsOnRef = useRef(true);
   const busLayerRef = useRef(L.layerGroup());   // live bus markers (Bus mode only)
   const busesRef = useRef(new Map());           // latest feed data, key -> bus
   const busMarkersRef = useRef(new Map());      // key -> labelled L.marker
@@ -282,6 +357,14 @@ function App() {
   const [screen, setScreen] = useState('search');
   const [mapType, setMapType] = useState('street');
   const [povMode, setPovMode] = useState('north');
+  const [reportPhase, setReportPhase] = useState('idle'); // idle | menu | locating | failed | draft | saving
+  const [reportCategory, setReportCategory] = useState(null);
+  const [reportDesc, setReportDesc] = useState('');
+  const [reportError, setReportError] = useState('');
+  const [reportControlsVisible, setReportControlsVisible] = useState(true);
+  const [reportFailInfo, setReportFailInfo] = useState(null);
+  const [reportDraftInfo, setReportDraftInfo] = useState(null);
+  const [reportToast, setReportToast] = useState('');
   const [transportMode, setTransportMode] = useState('car');
   const [start, setStart] = useState('');
   const [end, setEnd] = useState('');
@@ -338,6 +421,8 @@ function App() {
     // Stacking: route lines (overlayPane 400) < buses 585 < route cameras 590 < live-location / group markers (markerPane 600)
     map.createPane('busPane').style.zIndex = '585';
     map.createPane('routeCameras').style.zIndex = '590';
+    map.createPane('reports').style.zIndex = '588';
+    map.createPane('reportDraft').style.zIndex = '650';
 
     streetLayerRef.current = L.tileLayer(MAP_LAYERS.street.url, { maxZoom: 19, attribution: MAP_LAYERS.street.attribution });
     satelliteLayerRef.current = L.tileLayer(MAP_LAYERS.satellite.url, { maxZoom: 19, attribution: MAP_LAYERS.satellite.attribution });
@@ -669,11 +754,426 @@ function App() {
     }
   };
 
+  // --- community reports ------------------------------------------------
+  // Leaflet callbacks (map events, popups, draft pin) are created once, so they call through
+  // reportApiRef, which is refreshed on every render and never holds stale state.
+  routeActiveRef.current = routeActive;
+  alertsOnRef.current = alertsOn;
+
+  const showReportToast = (msg) => {
+    setReportToast(msg);
+    clearTimeout(reportToastTimerRef.current);
+    reportToastTimerRef.current = setTimeout(() => setReportToast(''), 5000);
+  };
+
+  const goReportPhase = (ph) => {
+    reportPhaseRef.current = ph;
+    placingReportRef.current = ['locating', 'failed', 'draft', 'saving'].includes(ph);
+    setReportPhase(ph);
+  };
+
+  const removeDraftMarker = () => {
+    if (draftMarkerRef.current) { draftMarkerRef.current.remove(); draftMarkerRef.current = null; }
+    draftLatLngRef.current = null;
+  };
+
+  const restorePovAfterReport = () => {
+    if (prevPovRef.current) { setPovMode(prevPovRef.current); prevPovRef.current = null; }
+  };
+
+  // Back to IDLE; nothing is saved.
+  const endReporting = () => {
+    if (reportPhaseRef.current === 'saving') return;
+    locateSeqRef.current += 1; // ignore any GPS answer still on its way
+    removeDraftMarker();
+    reportRequestIdRef.current = null;
+    setReportCategory(null);
+    setReportDesc('');
+    setReportError('');
+    setReportFailInfo(null);
+    setReportDraftInfo(null);
+    setReportControlsVisible(true);
+    goReportPhase('idle');
+    restorePovAfterReport();
+  };
+
+  const handleReportButton = () => {
+    const ph = reportPhaseRef.current;
+    if (ph === 'saving') { showReportToast('Saving your report… please wait.'); return; }
+    if (ph === 'idle') { goReportPhase('menu'); return; }
+    endReporting();
+  };
+
+  const startDraft = (catId, latlng, source, accuracy) => {
+    const map = mapRef.current;
+    if (!map) return;
+    removeDraftMarker();
+    const marker = L.marker(latlng, {
+      pane: 'reportDraft',
+      draggable: true,
+      autoPan: false,
+      keyboard: true,
+      zIndexOffset: 1000,
+      title: 'Draft report pin. Drag to adjust.',
+      icon: L.divIcon({ className: 'report-draft-icon', html: draftPinHtml(catId), iconSize: [48, 60], iconAnchor: [24, 60] }),
+    }).addTo(map);
+    marker.on('dragstart', () => reportApiRef.current.onDraftDragStart());
+    marker.on('dragend', () => reportApiRef.current.onDraftDragEnd());
+    marker.on('click', () => reportApiRef.current.onDraftTap());
+    draftMarkerRef.current = marker;
+    draftLatLngRef.current = latlng;
+    reportRequestIdRef.current = newRequestId();
+    setReportCategory(catId);
+    setReportDraftInfo({ source, accuracy: accuracy == null ? null : accuracy });
+    setReportError('');
+    setReportFailInfo(null);
+    setReportControlsVisible(true);
+    goReportPhase('draft');
+    map.setView(latlng, Math.max(map.getZoom(), 16), { animate: true });
+  };
+
+  const failLocation = (catId, message, fix, accuracy) => {
+    setReportFailInfo({ id: catId, message, fix, accuracy });
+    goReportPhase('failed');
+  };
+
+  const pickReportCategory = (catId) => {
+    if (reportPhaseRef.current !== 'menu') return;
+    setReportCategory(catId);
+    setReportDesc('');
+    setReportError('');
+    // Rotated (heading-up) maps cannot drag markers reliably: switch to north-up while placing.
+    if (povMode === 'heading' && !prevPovRef.current) { prevPovRef.current = 'heading'; setPovMode('north'); }
+    goReportPhase('locating');
+    const seq = ++locateSeqRef.current;
+    if (!navigator.geolocation) { failLocation(catId, 'This browser has no location support.', null, null); return; }
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        if (seq !== locateSeqRef.current) return;
+        const ll = L.latLng(pos.coords.latitude, pos.coords.longitude);
+        const acc = pos.coords.accuracy;
+        const age = pos.timestamp ? Date.now() - pos.timestamp : 0;
+        if (age > REPORT_FIX_MAX_AGE_MS) { failLocation(catId, 'Your location reading is out of date.', ll, acc); return; }
+        if (acc > REPORT_FIX_MAX_ACCURACY_M) { failLocation(catId, `Your location is only accurate to about ±${Math.round(acc)} m.`, ll, acc); return; }
+        startDraft(catId, ll, 'gps', acc);
+      },
+      (err) => {
+        if (seq !== locateSeqRef.current) return;
+        const msg = err && err.code === 1
+          ? 'Location permission is off. Allow location for this site to start at your position.'
+          : err && err.code === 3 ? 'Getting your location took too long.' : 'Your location is unavailable right now.';
+        failLocation(catId, msg, null, null);
+      },
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 5000 }
+    );
+  };
+
+  const submitDraft = async () => {
+    if (reportPhaseRef.current !== 'draft') return;
+    const ll = draftLatLngRef.current;
+    const cat = reportCategory;
+    if (!ll || !cat) return;
+    const desc = cat === 'other' ? reportDesc.trim().slice(0, REPORT_DESC_MAX) : null;
+    goReportPhase('saving');
+    setReportError('');
+    if (draftMarkerRef.current) draftMarkerRef.current.dragging.disable();
+    try {
+      const { data, error } = await withTimeout(
+        supabase.rpc('create_report', {
+          p_category: cat,
+          p_lat: ll.lat,
+          p_lng: ll.lng,
+          p_description: desc || null,
+          p_request_id: reportRequestIdRef.current,
+          p_position_source: reportDraftInfo?.source || 'gps',
+          p_accuracy_m: reportDraftInfo?.accuracy ?? null,
+        }),
+        REPORT_SAVE_TIMEOUT_MS
+      );
+      if (error) throw error;
+      showReportToast(data?.merged ? 'This is already reported here. It is on the map.' : 'Report saved. Thank you!');
+      removeDraftMarker();
+      reportRequestIdRef.current = null;
+      setReportCategory(null);
+      setReportDesc('');
+      setReportDraftInfo(null);
+      setReportControlsVisible(true);
+      goReportPhase('idle');
+      restorePovAfterReport();
+      loadMyReports();
+      loadReports();
+    } catch (e) {
+      if (draftMarkerRef.current) draftMarkerRef.current.dragging.enable();
+      setReportError(
+        e && e.timeout
+          ? 'Not confirmed: the connection was slow, so we cannot tell if it saved. Tap Place here to retry. It will not create a duplicate.'
+          : reportErrorText(e, 'Could not save your report. Check your connection and try again.')
+      );
+      setReportControlsVisible(true);
+      goReportPhase('draft');
+    }
+  };
+
+  // ---- saved reports on the map ----
+  const syncReportMarkers = () => {
+    const layer = reportsLayerRef.current;
+    if (!layer) return;
+    const showCams = alertsOnRef.current;
+    const want = new Map();
+    [...viewportRowsRef.current, ...routeRowsRef.current].forEach((r) => {
+      if (dismissedIdsRef.current.has(r.id)) return;
+      if (r.category === 'speed_camera' && !showCams && !r.is_mine) return; // Camera alerts off hides cameras only
+      want.set(r.id, r);
+    });
+    mineRowsRef.current.forEach((r) => { if (!want.has(r.id) && !dismissedIdsRef.current.has(r.id)) want.set(r.id, r); });
+
+    const existing = reportMarkersRef.current;
+    want.forEach((r, id) => {
+      const sig = `${r.status}|${r.confirms}|${r.denies}|${r.my_vote || ''}|${r.is_mine ? 1 : 0}`;
+      let m = existing.get(id);
+      if (!m) {
+        const cat = REPORT_CATEGORY_BY_ID[r.category] || REPORT_CATEGORY_BY_ID.other;
+        m = L.marker([r.latitude, r.longitude], { pane: 'reports', icon: reportMarkerIcon(r), title: cat.label, alt: cat.label, keyboard: true });
+        const mk = m;
+        mk.bindPopup(() => reportApiRef.current.buildPopup(mk._report), { minWidth: 210, maxWidth: 260 });
+        layer.addLayer(mk);
+        existing.set(id, mk);
+        mk._sig = sig;
+      } else if (m._sig !== sig) {
+        m.setIcon(reportMarkerIcon(r));
+        m._sig = sig;
+      }
+      m._report = r;
+    });
+    existing.forEach((m, id) => { if (!want.has(id)) { layer.removeLayer(m); existing.delete(id); } });
+  };
+
+  const loadReports = async (opts = {}) => {
+    const map = mapRef.current;
+    if (!map) return;
+    const token = ++reportsReqRef.current;
+    const route = 'route' in opts ? opts.route : (routeActiveRef.current ? selectedRouteRef.current : null);
+    const coords = route && route.coordinates;
+    try {
+      if (coords && coords.length > 1) {
+        // Route mode: every category, only within REPORT_ROUTE_MAX_DISTANCE_M of the route.
+        let minLat = Infinity, maxLat = -Infinity, minLng = Infinity, maxLng = -Infinity;
+        coords.forEach((c) => {
+          if (c.lat < minLat) minLat = c.lat;
+          if (c.lat > maxLat) maxLat = c.lat;
+          if (c.lng < minLng) minLng = c.lng;
+          if (c.lng > maxLng) maxLng = c.lng;
+        });
+        const padLat = 0.0015;
+        const padLng = padLat / Math.cos(((minLat + maxLat) / 2 * Math.PI) / 180);
+        const { data, error } = await supabase.rpc('get_reports_in_bbox', {
+          p_min_lat: minLat - padLat, p_min_lng: minLng - padLng, p_max_lat: maxLat + padLat, p_max_lng: maxLng + padLng,
+          p_categories: null, p_limit: 1000,
+        });
+        if (token !== reportsReqRef.current) return;
+        if (error) throw error;
+        const { cum } = buildRouteProgress(coords);
+        routeRowsRef.current = matchCamerasToRoute(coords, cum, data || [], REPORT_ROUTE_MAX_DISTANCE_M).map((m) => m.camera);
+        viewportRowsRef.current = [];
+      } else {
+        // No route: only speed cameras, for the visible area.
+        routeRowsRef.current = [];
+        if (map.getZoom() < REPORT_MIN_ZOOM) {
+          viewportRowsRef.current = [];
+        } else {
+          const b = map.getBounds();
+          const { data, error } = await supabase.rpc('get_reports_in_bbox', {
+            p_min_lat: b.getSouth(), p_min_lng: b.getWest(), p_max_lat: b.getNorth(), p_max_lng: b.getEast(),
+            p_categories: ['speed_camera'], p_limit: 1000,
+          });
+          if (token !== reportsReqRef.current) return;
+          if (error) throw error;
+          viewportRowsRef.current = data || [];
+        }
+      }
+      syncReportMarkers();
+    } catch (e) {
+      console.error('Reports unavailable:', (e && e.message) || 'unknown error');
+    }
+  };
+
+  const loadMyReports = async () => {
+    try {
+      const { data, error } = await supabase.rpc('get_my_reports');
+      if (error) throw error;
+      mineRowsRef.current = data || [];
+      syncReportMarkers();
+    } catch (e) {
+      console.error('My reports unavailable:', (e && e.message) || 'unknown error');
+    }
+  };
+
+  const getFreshFix = () =>
+    new Promise((resolve, reject) => {
+      if (!navigator.geolocation) { reject(new Error('no-geolocation')); return; }
+      navigator.geolocation.getCurrentPosition(
+        (pos) => resolve(L.latLng(pos.coords.latitude, pos.coords.longitude)),
+        (err) => reject(err),
+        { enableHighAccuracy: true, timeout: 8000, maximumAge: 10000 }
+      );
+    });
+
+  const voteOnReport = async (r, vote) => {
+    let here;
+    try { here = await getFreshFix(); } catch (e) { showReportToast('Turn on location to answer. We only accept answers from people near the report.'); return; }
+    if (here.distanceTo(L.latLng(r.latitude, r.longitude)) > REPORT_VOTE_RADIUS_M) {
+      showReportToast(`Get within ${REPORT_VOTE_RADIUS_M} m of this report to answer.`);
+      return;
+    }
+    const { error } = await supabase.rpc('vote_report', { p_report_id: r.id, p_vote: vote, p_lat: here.lat, p_lng: here.lng });
+    if (error) { showReportToast(reportErrorText(error, 'Could not send your answer. Try again.')); return; }
+    if (mapRef.current) mapRef.current.closePopup();
+    showReportToast('Thanks, your answer was saved.');
+    loadReports();
+    loadMyReports();
+  };
+
+  const hideReportForMe = async (r) => {
+    const { error } = await supabase.rpc('dismiss_report', { p_report_id: r.id });
+    if (error) { showReportToast(reportErrorText(error, 'Could not hide this report. Try again.')); return; }
+    dismissedIdsRef.current.add(r.id);
+    if (mapRef.current) mapRef.current.closePopup();
+    syncReportMarkers();
+    showReportToast('Hidden for you. Other people still see it.');
+  };
+
+  // Popup content is built with DOM nodes and textContent, so report text can never inject HTML.
+  const buildReportPopup = (r) => {
+    const cat = REPORT_CATEGORY_BY_ID[r.category] || REPORT_CATEGORY_BY_ID.other;
+    const root = document.createElement('div');
+    root.className = 'report-popup';
+    const head = document.createElement('div');
+    head.className = 'report-popup-head';
+    const badge = document.createElement('span');
+    badge.className = 'report-popup-badge';
+    badge.style.background = cat.color;
+    badge.innerHTML = reportIconSvg(r.category, 16); // constant SVG from reportIcons.js
+    const title = document.createElement('strong');
+    title.textContent = cat.label;
+    head.append(badge, title);
+    root.appendChild(head);
+    const line = (cls, text) => { const d = document.createElement('div'); d.className = cls; d.textContent = text; root.appendChild(d); return d; };
+    if (r.description) line('report-popup-desc', r.description);
+    const statusText = {
+      unconfirmed: 'Community-reported · not yet confirmed',
+      community_confirmed: 'Community-confirmed',
+      dimmed: 'Possibly gone: several people say it is not there',
+    }[r.status] || 'Community-reported';
+    line('report-popup-status', statusText);
+    line('report-popup-meta', `Last seen ${reportAgo(r.last_confirmed_at || r.created_at)} · ${r.confirms} still there · ${r.denies} not there`);
+    const btn = (label, cls, fn) => { const b = document.createElement('button'); b.type = 'button'; b.className = cls; b.textContent = label; b.onclick = fn; return b; };
+    if (r.is_mine) {
+      line('report-popup-note', 'This is your report. Other people can confirm it.');
+    } else if (r.my_vote) {
+      line('report-popup-note', `You answered: ${r.my_vote === 'confirm' ? 'still there' : 'not there'}.`);
+    } else {
+      line('report-popup-q', 'Is it still there?');
+      const row = document.createElement('div');
+      row.className = 'report-popup-actions';
+      row.append(
+        btn('Still there', 'report-btn primary small', () => reportApiRef.current.vote(r, 'confirm')),
+        btn('Not there', 'report-btn small', () => reportApiRef.current.vote(r, 'deny'))
+      );
+      root.appendChild(row);
+    }
+    if (!r.is_mine) root.appendChild(btn('Hide for me', 'report-link', () => reportApiRef.current.hideForMe(r)));
+    line('report-popup-disclaimer', 'Community reports can be wrong. Always follow road signs and traffic rules.');
+    return root;
+  };
+
+  reportApiRef.current = {
+    loadReports,
+    loadMyReports,
+    endReporting,
+    buildPopup: buildReportPopup,
+    vote: voteOnReport,
+    hideForMe: hideReportForMe,
+    onDraftDragStart: () => { justDraggedRef.current = Date.now(); },
+    onDraftDragEnd: () => {
+      const m = draftMarkerRef.current;
+      if (!m) return;
+      draftLatLngRef.current = m.getLatLng();
+      justDraggedRef.current = Date.now();
+      setReportDraftInfo((i) => ({ ...(i || {}), source: i && i.source === 'manual' ? 'manual' : 'adjusted' }));
+      setReportControlsVisible(true);
+    },
+    onDraftTap: () => {
+      if (reportPhaseRef.current === 'draft' && Date.now() - justDraggedRef.current > 400) setReportControlsVisible(true);
+    },
+    // A tap on the bare map hides Place here / Cancel. It never moves, saves or deletes the draft.
+    onMapClick: () => {
+      if (reportPhaseRef.current === 'draft' && Date.now() - justDraggedRef.current > 400) setReportControlsVisible(false);
+    },
+    onPopupOpen: () => {
+      if (reportPhaseRef.current === 'draft') setReportControlsVisible(false);
+    },
+  };
+
+  // Map listeners, periodic refresh, first load.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return undefined;
+    if (!reportsLayerRef.current) reportsLayerRef.current = L.layerGroup();
+    reportsLayerRef.current.addTo(map);
+    let moveTimer = null;
+    const onMove = () => {
+      clearTimeout(moveTimer);
+      moveTimer = setTimeout(() => { if (!routeActiveRef.current) reportApiRef.current.loadReports(); }, 600);
+    };
+    const onClick = () => reportApiRef.current.onMapClick();
+    const onPopup = () => reportApiRef.current.onPopupOpen();
+    map.on('moveend', onMove);
+    map.on('click', onClick);
+    map.on('popupopen', onPopup);
+    const iv = setInterval(() => reportApiRef.current.loadReports(), REPORT_REFRESH_MS);
+    return () => {
+      clearTimeout(moveTimer);
+      clearInterval(iv);
+      clearTimeout(reportToastTimerRef.current);
+      reportsReqRef.current += 1;
+      map.off('moveend', onMove);
+      map.off('click', onClick);
+      map.off('popupopen', onPopup);
+    };
+  }, []);
+
+  // Reload once the (guest or real) session exists, and again if the user changes.
+  useEffect(() => {
+    if (!authUser) return;
+    dismissedIdsRef.current = new Set();
+    reportApiRef.current.loadReports();
+    reportApiRef.current.loadMyReports();
+  }, [authUser?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Camera alerts checkbox shows/hides speed cameras (imported + reported).
+  useEffect(() => { syncReportMarkers(); }, [alertsOn]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Reporting only exists on the search and drive screens.
+  useEffect(() => {
+    if (screen !== 'search' && screen !== 'drive' && reportPhaseRef.current !== 'idle' && reportPhaseRef.current !== 'saving') {
+      reportApiRef.current.endReporting();
+    }
+  }, [screen]);
+
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === 'Escape' && reportPhaseRef.current !== 'idle' && reportPhaseRef.current !== 'saving') reportApiRef.current.endReporting();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
   // Leaving the route view (Back to search) cancels the route cameras.
   useEffect(() => {
     if (screen === 'search') {
       clearRouteCameras();
       setRouteActive(false);
+      loadReports({ route: null });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [screen]);
@@ -798,6 +1298,7 @@ function App() {
     clearRouteProgress(); // new route selected: drop old progress, show it fully blue
     setRouteActive(true);
     updateRouteCameras(route); // cameras near THIS route (replaces any previous set)
+    loadReports({ route });
     selectedRouteRef.current = route;
     const distanceKm = (route.summary.totalDistance / 1000).toFixed(1);
     const etaText = formatMinutes(route.summary.totalTime / 60);
@@ -986,7 +1487,7 @@ function App() {
 
         if (screen === 'drive') {
           // follow the user, keep whatever zoom they have (and don't interrupt the flyTo)
-          if (!flyingRef.current) mapRef.current.panTo(coords, { animate: true, duration: 0.5 });
+          if (!flyingRef.current && !placingReportRef.current) mapRef.current.panTo(coords, { animate: true, duration: 0.5 });
           updateRouteProgress(coords, position.coords.accuracy);
           if (lastHeadingCoordsRef.current && coords.distanceTo(lastHeadingCoordsRef.current) > 3) {
             const bearing = computeBearing(lastHeadingCoordsRef.current, coords);
@@ -1200,6 +1701,102 @@ function App() {
     </>
   );
 
+  const reportActive = reportPhase !== 'idle';
+  const reportDriveClass = screen === 'drive' ? 'drive-pos' : '';
+  const reportCatLabel = (REPORT_CATEGORY_BY_ID[reportCategory] || {}).label || '';
+  const reportSaving = reportPhase === 'saving';
+  const reportHint =
+    !reportDraftInfo ? ''
+      : reportDraftInfo.source === 'gps'
+        ? `Your phone's GPS position${reportDraftInfo.accuracy ? ` (about ±${Math.round(reportDraftInfo.accuracy)} m)` : ''}. Drag the pin to adjust it.`
+        : reportDraftInfo.source === 'adjusted'
+          ? 'Position adjusted by you. Drag the pin to change it.'
+          : 'Placed manually on the map. Drag the pin onto the right spot.';
+
+  const reportButton = (drivePos) => (
+    <button
+      className={`fab report-fab ${drivePos ? 'drive-pos' : ''} ${reportActive ? 'active' : ''}`}
+      type="button"
+      onClick={handleReportButton}
+      aria-pressed={reportActive}
+      aria-label={reportActive ? 'Cancel reporting' : 'Report a camera or hazard'}
+      title={reportActive ? 'Cancel reporting' : 'Report'}
+    >
+      <span dangerouslySetInnerHTML={{ __html: iconSvg(REPORT_BUTTON_ICON_INNER, 24, 'currentColor') }} />
+    </button>
+  );
+
+  const reportOverlays = (
+    <>
+      {(screen === 'search' || screen === 'drive') && reportPhase === 'menu' && (
+        <div className={`report-menu ${reportDriveClass}`} role="menu" aria-label="Choose what to report">
+          {REPORT_CATEGORIES.map((c) => (
+            <button
+              key={c.id}
+              type="button"
+              role="menuitem"
+              className="report-cat"
+              style={{ background: c.color }}
+              aria-label={c.label}
+              title={c.label}
+              onClick={() => pickReportCategory(c.id)}
+              dangerouslySetInnerHTML={{ __html: reportIconSvg(c.id, 26) }}
+            />
+          ))}
+        </div>
+      )}
+
+      {reportPhase === 'locating' && (
+        <div className={`report-panel ${reportDriveClass}`} role="status">
+          <div className="report-panel-text">Getting your location…</div>
+          <div className="report-panel-actions">
+            <button type="button" className="report-btn" onClick={endReporting}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {reportPhase === 'failed' && reportFailInfo && (
+        <div className={`report-panel ${reportDriveClass}`} role="alert">
+          <div className="report-panel-text">{reportFailInfo.message}</div>
+          <div className="report-panel-hint">GPS can be off by tens of metres, so always check the pin before saving.</div>
+          <div className="report-panel-actions">
+            <button type="button" className="report-btn primary" onClick={() => startDraft(reportFailInfo.id, mapRef.current.getCenter(), 'manual', null)}>Place manually</button>
+            {reportFailInfo.fix && (
+              <button type="button" className="report-btn" onClick={() => startDraft(reportFailInfo.id, reportFailInfo.fix, 'gps', reportFailInfo.accuracy)}>Use anyway</button>
+            )}
+            <button type="button" className="report-btn" onClick={endReporting}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {(reportPhase === 'draft' || reportSaving) && reportControlsVisible && (
+        <div className={`report-panel ${reportDriveClass}`} role="group" aria-label={`Place report: ${reportCatLabel}`}>
+          <div className="report-panel-text">{reportCatLabel}</div>
+          {reportCategory === 'other' && (
+            <input
+              className="report-desc"
+              type="text"
+              maxLength={REPORT_DESC_MAX}
+              placeholder="Short description (optional)"
+              aria-label="Short description (optional)"
+              value={reportDesc}
+              disabled={reportSaving}
+              onChange={(e) => setReportDesc(e.target.value)}
+            />
+          )}
+          <div className="report-panel-hint">{reportHint}</div>
+          {reportError && <div className="report-panel-error" role="alert">{reportError}</div>}
+          <div className="report-panel-actions">
+            <button type="button" className="report-btn primary" disabled={reportSaving} onClick={submitDraft}>{reportSaving ? 'Saving…' : 'Place here'}</button>
+            <button type="button" className="report-btn" disabled={reportSaving} onClick={endReporting}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {reportToast && <div className="report-toast" role="status">{reportToast}</div>}
+    </>
+  );
+
   return (
     <>
       <div id="map" className={mapType === 'satellite' ? 'satellite-mode' : ''} />
@@ -1236,6 +1833,7 @@ function App() {
           {status && <div className="toast">{status}</div>}
 
           <button className="fab maptype-fab" type="button" onClick={toggleMapType} aria-label="Toggle satellite view">{mapType === 'street' ? '🛰️' : '🗺️'}</button>
+          {reportButton(false)}
           <button className="fab locate-fab" type="button" onClick={handleMyLocation} aria-label="Use my location">◎</button>
           <button className={`fab-primary search-fab ${loading ? 'loading' : ''}`} type="button" onClick={calculateRoute} disabled={loading}>
             {loading ? 'Searching...' : 'Search route'}
@@ -1302,6 +1900,7 @@ function App() {
           </div>
 
           <button className="fab maptype-fab drive-pos" type="button" onClick={toggleMapType} aria-label="Toggle satellite view">{mapType === 'street' ? '🛰️' : '🗺️'}</button>
+          {reportButton(true)}
           <button className="fab pov-fab" type="button" onClick={() => setPovMode((p) => (p === 'north' ? 'heading' : 'north'))} aria-label="Toggle map orientation">
             {povMode === 'north' ? '🧭' : '🔼'}
           </button>
@@ -1453,6 +2052,7 @@ function App() {
           )}
         </>
       )}
+      {reportOverlays}
     </>
   );
 }
